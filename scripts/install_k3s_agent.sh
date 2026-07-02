@@ -3,6 +3,8 @@
 SERVER_IP="192.168.56.110"
 WORKER_IP="192.168.56.111"
 
+apt-get update && apt-get install -y net-tools
+
 until [ -f /vagrant/node-token ]; do
   sleep 1
 done

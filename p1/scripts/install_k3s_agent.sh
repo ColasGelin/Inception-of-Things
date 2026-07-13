@@ -2,16 +2,11 @@
 
 SERVER_IP="192.168.56.110"
 WORKER_IP="192.168.56.111"
+TOKEN="mysecrettoken123"
 
 set -e
 
 apt-get update && apt-get install -y net-tools curl
-
-until [ -f /vagrant/node-token ]; do
-  sleep 1
-done
-
-TOKEN=$(cat /vagrant/node-token)
 
 curl -sfL https://get.k3s.io | \
   K3S_URL="https://${SERVER_IP}:6443" \

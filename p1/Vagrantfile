@@ -9,7 +9,7 @@ Vagrant.configure("2") do |config|
     server.vm.network "private_network", ip: "192.168.56.110"
     server.vm.provider "libvirt" do |vb|
       vb.memory = 1024
-      vb.cpus = 1
+      vb.cpus = 2
       vb.driver = "qemu"
     end
     server.vm.provision "shell", path: "scripts/install_k3s_server.sh"
@@ -21,7 +21,7 @@ Vagrant.configure("2") do |config|
     worker.vm.network "private_network", ip: "192.168.56.111"
     worker.vm.provider "libvirt" do |vb|
       vb.memory = 1024
-      vb.cpus = 1
+      vb.cpus = 2
       vb.driver = "qemu"
     end
     worker.vm.provision "shell", path: "scripts/install_k3s_agent.sh"

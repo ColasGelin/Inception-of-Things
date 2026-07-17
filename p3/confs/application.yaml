@@ -7,8 +7,8 @@ spec:
   project: default
   source:
     repoURL: https://github.com/Maj-e/Inception-of-Things-CI
-    targetRevision: HEAD
-    path: p3/confs/manifests
+    targetRevision: main
+    path: manifests
   destination:
     server: https://kubernetes.default.svc
     namespace: dev
@@ -16,5 +16,3 @@ spec:
     automated:
       prune: true
       selfHeal: true
-    syncOptions:
-      - CreateNamespace=false

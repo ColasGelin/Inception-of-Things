@@ -1,6 +1,6 @@
 LOGIN = "mjeannin"
 
-PROVIDER  = "libvirt"
+PROVIDER  = "virtualbox"
 VM_MEMORY = 4048
 VM_CPUS   = 4
 

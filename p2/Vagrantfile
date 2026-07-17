@@ -1,17 +1,23 @@
 LOGIN = "mjeannin"
 
+PROVIDER  = "libvirt"
+VM_MEMORY = 4048
+VM_CPUS   = 4
+
+SERVER_IP = "192.168.56.110"
+BOX_IMAGE = "debian/bookworm64"
+
 Vagrant.configure("2") do |config|
 
   config.vm.define "#{LOGIN}S" do |server|
-    server.vm.box = "debian/bookworm64"
+    server.vm.box = BOX_IMAGE
     server.vm.hostname = "#{LOGIN}S"
-    server.vm.network "private_network", ip: "192.168.56.110"
-    server.vm.synced_folder ".", "/vagrant", type: "rsync"
-    server.vm.provider "libvirt" do |vb|
-      vb.memory = 2048
-      vb.cpus = 2
-      vb.driver = "qemu"
+    server.vm.network "private_network", ip: SERVER_IP
+    server.vm.provider PROVIDER do |vb|
+      vb.memory = VM_MEMORY
+      vb.cpus = VM_CPUS
     end
     server.vm.provision "shell", path: "scripts/install_k3s_server.sh"
   end
+
 end

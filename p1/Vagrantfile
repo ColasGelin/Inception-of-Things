@@ -1,28 +1,37 @@
-LOGIN = "cgelin"
+LOGIN = "mjeannin"
+
+PROVIDER    = "virtualbox"
+VM_MEMORY   = 2048
+VM_CPUS     = 2
+
+SERVER_IP   = "192.168.56.110"
+WORKER_IP   = "192.168.56.111"
+
+BOX_IMAGE   = "debian/bookworm64"
 
 Vagrant.configure("2") do |config|
-  config.vm.synced_folder ".", "/vagrant", type: "rsync"
+#  config.vm.synced_folder "/home/#{LOGIN}/sgoinfre/iot", "/vagrant", type: "rsync"
 
   config.vm.define "#{LOGIN}S" do |server|
-    server.vm.box = "debian/bookworm64"
+    server.vm.box = BOX_IMAGE
     server.vm.hostname = "#{LOGIN}S"
-    server.vm.network "private_network", ip: "192.168.56.110"
-    server.vm.provider "libvirt" do |vb|
-      vb.memory = 1024
-      vb.cpus = 2
-      vb.driver = "qemu"
+    server.vm.network "private_network", ip: SERVER_IP
+    server.vm.provider PROVIDER do |vb|
+      vb.name = "#{LOGIN}S"
+      vb.memory = VM_MEMORY
+      vb.cpus = VM_CPUS
     end
     server.vm.provision "shell", path: "scripts/install_k3s_server.sh"
   end
 
   config.vm.define "#{LOGIN}SW" do |worker|
-    worker.vm.box = "debian/bookworm64"
+    worker.vm.box = BOX_IMAGE
     worker.vm.hostname = "#{LOGIN}SW"
-    worker.vm.network "private_network", ip: "192.168.56.111"
-    worker.vm.provider "libvirt" do |vb|
-      vb.memory = 1024
-      vb.cpus = 2
-      vb.driver = "qemu"
+    worker.vm.network "private_network", ip: WORKER_IP
+    worker.vm.provider PROVIDER do |vb|
+      vb.name = "#{LOGIN}SW"
+      vb.memory = VM_MEMORY
+      vb.cpus = VM_CPUS
     end
     worker.vm.provision "shell", path: "scripts/install_k3s_agent.sh"
   end

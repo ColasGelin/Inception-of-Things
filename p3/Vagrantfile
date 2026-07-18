@@ -11,7 +11,7 @@ Vagrant.configure("2") do |config|
   config.vm.box = "generic/ubuntu2204" 
   config.vm.hostname = "#{LOGIN}S"
 
-  config.vm.provider :PROVIDER do |lv|
+  config.vm.provider PROVIDER do |lv|
     lv.cpus = "#{VM_CPUS}"
     lv.memory = "#{VM_MEMORY}"
     lv.name = "#{LOGIN}_VM"

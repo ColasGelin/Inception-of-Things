@@ -1,0 +1,89 @@
+global:
+  edition: ce
+  hosts:
+    domain: mjeannin.com
+  ingress:
+    enabled: true
+    class: traefik
+    configureCertmanager: false
+  psql:
+    connectTimeout: 30
+
+installCertmanager: false
+certmanager-issuer:
+  email: fake@fake.com
+
+nginx-ingress:
+  enabled: false
+
+prometheus:
+  install: false
+
+gitlab-runner:
+  install: false
+
+registry:
+  enabled: false
+
+gitlab:
+  gitlab-shell:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 100m, memory: 128Mi}
+  kas:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests: {cpu: 30m, memory: 64Mi}
+      limits: {cpu: 100m, memory: 128Mi}
+  webservice:
+    workerProcesses: 1
+    resources:
+      requests: {cpu: 150m, memory: 700Mi}
+      limits: {cpu: 300m, memory: 900Mi}
+    minReplicas: 1
+    maxReplicas: 1
+  sidekiq:
+    concurrency: 5
+    resources:
+      requests: {cpu: 50m, memory: 300Mi}
+      limits: {cpu: 150m, memory: 500Mi}
+    minReplicas: 1
+    maxReplicas: 1
+  toolbox:
+    enabled: false
+  gitaly:
+    resources:
+      requests: {cpu: 50m, memory: 200Mi}
+      limits: {cpu: 150m, memory: 300Mi}
+    persistence:
+      size: 5Gi
+
+postgresql:
+  install: true
+  resources:
+    requests: {cpu: 50m, memory: 200Mi}
+    limits: {cpu: 150m, memory: 300Mi}
+  persistence:
+    size: 2Gi
+
+redis:
+  install: true
+  resources:
+    requests: {cpu: 30m, memory: 64Mi}
+    limits: {cpu: 100m, memory: 128Mi}
+  master:
+    persistence:
+      size: 1Gi
+
+minio:
+  persistence:
+    size: 2Gi
+  resources:
+    requests: {cpu: 30m, memory: 64Mi}
+    limits: {cpu: 100m, memory: 128Mi}
+
+gitlab-pages:
+  enabled: false

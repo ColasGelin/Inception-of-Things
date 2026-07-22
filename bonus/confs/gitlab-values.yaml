@@ -8,6 +8,8 @@ global:
     configureCertmanager: false
   psql:
     connectTimeout: 30
+  kas:
+    enabled: false
 
 installCertmanager: false
 certmanager-issuer:
@@ -26,32 +28,48 @@ registry:
   enabled: false
 
 gitlab:
+  gitlab-exporter:
+    enabled: false
   gitlab-shell:
     minReplicas: 1
     maxReplicas: 1
     resources:
       requests: {cpu: 50m, memory: 64Mi}
       limits: {cpu: 100m, memory: 128Mi}
-  kas:
-    minReplicas: 1
-    maxReplicas: 1
-    resources:
-      requests: {cpu: 30m, memory: 64Mi}
-      limits: {cpu: 100m, memory: 128Mi}
   webservice:
     workerProcesses: 1
     resources:
-      requests: {cpu: 150m, memory: 700Mi}
-      limits: {cpu: 300m, memory: 900Mi}
+      requests: {cpu: 150m, memory: 900Mi}
+      limits: {cpu: 300m, memory: 1500Mi}
     minReplicas: 1
     maxReplicas: 1
+    livenessProbe:
+      initialDelaySeconds: 180
+      periodSeconds: 15
+      timeoutSeconds: 10
+      failureThreshold: 6
+    readinessProbe:
+      initialDelaySeconds: 60
+      periodSeconds: 15
+      timeoutSeconds: 10
+      failureThreshold: 6
   sidekiq:
     concurrency: 5
     resources:
-      requests: {cpu: 50m, memory: 300Mi}
-      limits: {cpu: 150m, memory: 500Mi}
+      requests: {cpu: 50m, memory: 400Mi}
+      limits: {cpu: 150m, memory: 700Mi}
     minReplicas: 1
     maxReplicas: 1
+    livenessProbe:
+      initialDelaySeconds: 180
+      periodSeconds: 15
+      timeoutSeconds: 10
+      failureThreshold: 6
+    readinessProbe:
+      initialDelaySeconds: 60
+      periodSeconds: 15
+      timeoutSeconds: 10
+      failureThreshold: 6
   toolbox:
     enabled: false
   gitaly:

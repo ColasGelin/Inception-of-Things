@@ -2,8 +2,8 @@
   LOGIN = "mjeannin"
 
   PROVIDER    = "virtualbox"
-  VM_MEMORY   = 4608
-  VM_CPUS     = 2
+  VM_MEMORY   = 5120
+  VM_CPUS     = 4
 
   SERVER_IP = "192.168.56.120"
 

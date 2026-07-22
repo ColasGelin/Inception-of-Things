@@ -12,8 +12,6 @@ global:
     enabled: false
 
 installCertmanager: false
-certmanager-issuer:
-  email: fake@fake.com
 
 nginx-ingress:
   enabled: false
@@ -31,51 +29,27 @@ gitlab:
   gitlab-exporter:
     enabled: false
   gitlab-shell:
-    minReplicas: 1
-    maxReplicas: 1
-    resources:
-      requests: {cpu: 50m, memory: 64Mi}
-      limits: {cpu: 100m, memory: 128Mi}
+    enabled: false
   webservice:
     workerProcesses: 1
     resources:
-      requests: {cpu: 150m, memory: 900Mi}
+      requests: {cpu: 100m, memory: 900Mi}
       limits: {cpu: 300m, memory: 1500Mi}
     minReplicas: 1
     maxReplicas: 1
-    livenessProbe:
-      initialDelaySeconds: 180
-      periodSeconds: 15
-      timeoutSeconds: 10
-      failureThreshold: 6
-    readinessProbe:
-      initialDelaySeconds: 60
-      periodSeconds: 15
-      timeoutSeconds: 10
-      failureThreshold: 6
   sidekiq:
     concurrency: 5
     resources:
-      requests: {cpu: 50m, memory: 400Mi}
-      limits: {cpu: 150m, memory: 700Mi}
+      requests: {cpu: 50m, memory: 256Mi}
+      limits: {cpu: 150m, memory: 256Mi}
     minReplicas: 1
     maxReplicas: 1
-    livenessProbe:
-      initialDelaySeconds: 180
-      periodSeconds: 15
-      timeoutSeconds: 10
-      failureThreshold: 6
-    readinessProbe:
-      initialDelaySeconds: 60
-      periodSeconds: 15
-      timeoutSeconds: 10
-      failureThreshold: 6
   toolbox:
     enabled: false
   gitaly:
     resources:
-      requests: {cpu: 50m, memory: 200Mi}
-      limits: {cpu: 150m, memory: 300Mi}
+      requests: {cpu: 50m, memory: 256Mi}
+      limits: {cpu: 150m, memory: 512Mi}
     persistence:
       size: 5Gi
 
@@ -88,6 +62,8 @@ postgresql:
     size: 2Gi
 
 redis:
+  metrics: 
+    enabled: false 
   install: true
   resources:
     requests: {cpu: 30m, memory: 64Mi}
@@ -95,13 +71,6 @@ redis:
   master:
     persistence:
       size: 1Gi
-
-minio:
-  persistence:
-    size: 2Gi
-  resources:
-    requests: {cpu: 30m, memory: 64Mi}
-    limits: {cpu: 100m, memory: 128Mi}
-
+      
 gitlab-pages:
   enabled: false

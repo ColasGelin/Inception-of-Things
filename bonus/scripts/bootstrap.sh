@@ -3,6 +3,12 @@
 
   CLUSTER_NAME="p3-cluster"
 
+  echo "Waiting for network..."
+  until curl -fsSL -o /dev/null https://charts.gitlab.io/ ; do
+    echo "Network not ready yet, retrying in 5s..."
+    sleep 5
+  done
+
   # --- Docker ---
   if ! command -v docker &> /dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -58,7 +64,12 @@
   # --- GitLab ---
   kubectl create namespace gitlab --dry-run=client -o yaml | kubectl apply -f -
 
-  helm repo add gitlab https://charts.gitlab.io/ || true
+  for i in {1..5}; do
+    helm repo add gitlab https://charts.gitlab.io/ && break
+    echo "helm repo add failed, retrying in 5s... ($i/5)"
+    sleep 5
+  done
+
   helm repo update
 
   if ! helm status gitlab -n gitlab &> /dev/null; then

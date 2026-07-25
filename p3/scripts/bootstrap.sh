@@ -41,7 +41,7 @@ kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
 echo "Waiting for ArgoCD deployments to become available..."
-kubectl -n argocd wait --for=condition=available --timeout=300s deployment --all
+kubectl -n argocd wait --for=condition=available --timeout=900s deployment --all
 
 # --- app namespace + ArgoCD Application ---
 kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -

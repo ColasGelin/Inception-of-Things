@@ -3,7 +3,7 @@
 
   PROVIDER    = "virtualbox"
   VM_MEMORY   = 5120
-  VM_CPUS     = 4
+  VM_CPUS     = 5
 
   SERVER_IP = "192.168.56.120"
 
@@ -11,7 +11,7 @@
     config.vm.box = "generic/ubuntu2204" 
     config.vm.hostname = "#{LOGIN}S"
 
-    config.vm.synced_folder ".", "/vagrant", type: "rsync"
+    config.vm.synced_folder "./confs", "/vagrant/confs", type: "rsync"
 
     config.vm.provider PROVIDER do |lv|
       lv.cpus = "#{VM_CPUS}"

@@ -1,0 +1,23 @@
+server:
+  resources:
+    requests: {memory: 64Mi, cpu: 50m}
+repoServer:
+  resources:
+    requests: {memory: 64Mi, cpu: 50m}
+redis:
+  resources:
+    requests: {memory: 32Mi, cpu: 10m}
+controller:
+  resources:
+    requests: {memory: 128Mi, cpu: 100m}
+applicationSet:
+  enabled: false
+notifications:
+  enabled: false
+dex:
+  enabled: false
+configs:
+  params:
+    server.insecure: true
+  cm:
+    timeout.reconciliation: 60s

@@ -2,6 +2,8 @@ global:
   edition: ce
   hosts:
     domain: mjeannin.com
+    https: false
+    ssh: false
   ingress:
     enabled: true
     class: traefik
@@ -65,18 +67,16 @@ gitlab:
 postgresql:
   install: true
   resources:
-    requests: {cpu: 50m, memory: 200Mi}
-    limits: {cpu: 150m, memory: 300Mi}
+    requests: {cpu: 100m, memory: 256Mi}
   persistence:
     size: 2Gi
 
 redis:
-  metrics: 
-    enabled: false 
+  metrics:
+    enabled: false
   install: true
   resources:
-    requests: {cpu: 30m, memory: 64Mi}
-    limits: {cpu: 100m, memory: 128Mi}
+    requests: {cpu: 50m, memory: 64Mi}
   master:
     persistence:
       size: 1Gi

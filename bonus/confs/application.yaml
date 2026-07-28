@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/Maj-e/Inception-of-Things-CI
+    repoURL: http://gitlab-webservice-default.gitlab.svc.cluster.local:8181/root/playground.git
     targetRevision: main
     path: manifests
   destination:

@@ -1,4 +1,4 @@
-  LOGIN = "mjeannin"
+  LOGIN = "cgelin"
 
   PROVIDER    = "virtualbox"
   VM_MEMORY   = 5120
@@ -10,7 +10,8 @@
     config.vm.box = "generic/ubuntu2204" 
     config.vm.hostname = "#{LOGIN}S"
 
-    config.vm.synced_folder "./confs", "/vagrant/confs", type: "rsync"
+    config.vm.synced_folder "./confs",   "/vagrant/confs",   type: "rsync"
+    config.vm.synced_folder "./scripts", "/vagrant/scripts", type: "rsync"
 
     config.vm.provider PROVIDER do |lv|
       lv.cpus = "#{VM_CPUS}"

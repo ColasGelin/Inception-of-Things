@@ -4,10 +4,17 @@ global:
     domain: mjeannin.com
     https: false
     ssh: false
+  global:
+  hosts:
+    domain: mjeannin.com
+    https: false
   ingress:
-    enabled: true
-    class: traefik
     configureCertmanager: false
+    tls:
+      enabled: false
+
+certmanager:
+  install: false
   psql:
     connectTimeout: 30
   kas:
@@ -31,6 +38,8 @@ gitlab-pages:
   enabled: false
 
 gitlab:
+    gitlab-exporter:
+      enabled: false
     gitaly:
         resources:
             requests:

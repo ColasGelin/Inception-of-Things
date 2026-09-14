@@ -51,8 +51,10 @@ progress() {
     sleep 0.3
   done
 
-  wait "$pid"
-  local status=$?
+  # Under `set -e` a bare failing `wait` would exit right here, before the
+  # FAILED line and the captured output get printed.
+  local status=0
+  wait "$pid" || status=$?
 
   if [ $status -eq 0 ]; then
     printf "\r\033[K  \xe2\x9c\x93 %s (%ss)\n" "$msg" "$((SECONDS - start))"

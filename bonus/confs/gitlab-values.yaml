@@ -4,14 +4,52 @@ global:
     domain: mjeannin.com
     https: false
     ssh: false
+
+  # Chart 10.x (GitLab 19) defaults to Gateway API + a bundled Envoy Gateway.
+  # We already have Traefik from k3s, so go back to a plain Ingress.
+  gatewayApi:
+    enabled: false
+    installEnvoy: false
+    configureCertmanager: false
   ingress:
     enabled: true
+    provider: traefik
     class: traefik
     configureCertmanager: false
+
+  # Chart 10.x no longer bundles PostgreSQL or Redis: both are deployed
+  # beforehand from confs/gitlab-deps.yaml.
   psql:
+    host: postgresql.gitlab.svc
+    port: 5432
+    database: gitlabhq_production
+    username: gitlab
     connectTimeout: 30
+    password:
+      secret: gitlab-postgresql-password
+      key: postgresql-password
+  redis:
+    host: redis.gitlab.svc
+    port: 6379
+    auth:
+      enabled: true
+      secret: gitlab-redis-secret
+      key: secret
+
   kas:
     enabled: false
+
+  # Chart 10.x also dropped the bundled MinIO, and these features require S3
+  # object storage when enabled. None of them is needed to host a Git repo.
+  appConfig:
+    lfs:
+      enabled: false
+    artifacts:
+      enabled: false
+    uploads:
+      enabled: false
+    packages:
+      enabled: false
 
 installCertmanager: false
 
@@ -25,9 +63,6 @@ gitlab-runner:
   install: false
 
 registry:
-  enabled: false
-
-gitlab-pages:
   enabled: false
 
 gitlab:
@@ -63,20 +98,3 @@ gitlab:
             requests:
                 memory: 256Mi
                 cpu: 50m
-
-postgresql:
-  install: true
-  resources:
-    requests: {cpu: 100m, memory: 256Mi}
-  persistence:
-    size: 2Gi
-
-redis:
-  metrics:
-    enabled: false
-  install: true
-  resources:
-    requests: {cpu: 50m, memory: 64Mi}
-  master:
-    persistence:
-      size: 1Gi

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CLUSTER_NAME="p3-cluster"
-GITLAB_CHART_VERSION="9.9.2"
+GITLAB_CHART_VERSION="10.3.2"
 
 # --- GitOps / GitLab settings ----------------------------------------------
 GITLAB_PROJECT_PATH="playground"
@@ -13,6 +13,9 @@ GITLAB_LOCAL_URL="http://localhost:${GITLAB_LOCAL_PORT}"
 GITLAB_INTERNAL_HOST="gitlab-webservice-default.gitlab.svc.cluster.local:8181"
 GITLAB_INTERNAL_REPO="http://${GITLAB_INTERNAL_HOST}/root/${GITLAB_PROJECT_PATH}.git"
 APP_IMAGE_REPO="wil42/playground"
+# Must match the images in confs/gitlab-deps.yaml
+POSTGRES_IMAGE="postgres:17-alpine"
+REDIS_IMAGE="redis:7.2-alpine"
 WORK_CLONE="/home/vagrant/${GITLAB_PROJECT_PATH}"
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,9 @@ retry() {
 # ---------------------------------------------------------------------------
 # 1. Wait for network
 # ---------------------------------------------------------------------------
+if ! command -v curl &> /dev/null; then
+  apt-get update -qq && apt-get install -y -qq curl
+fi
 phase "Waiting for network"
 progress "Waiting for charts.gitlab.io to be reachable" bash -c '
   until curl -fsSL -o /dev/null https://charts.gitlab.io/; do
@@ -169,20 +175,21 @@ cp /root/.kube/config /home/vagrant/.kube/config
 chown -R vagrant:vagrant /home/vagrant/.kube
 
 # ---------------------------------------------------------------------------
-# 6. Pre-import application images
+# 6. Pre-import images
 #
 # Pull on the HOST and side-load into the k3d nodes so the kubelet never has to
 # reach Docker Hub. With GitLab running this VM is memory-starved, CoreDNS gets
 # flaky, and in-cluster image pulls fail with "lookup registry-1.docker.io:
-# Try again". Importing both tags up front makes the v1 -> v2 demo immune to
-# that (and to Docker Hub rate limits).
+# Try again". Importing both app tags up front makes the v1 -> v2 demo immune to
+# that (and to Docker Hub rate limits); the datastore images get the same
+# treatment so a restarted PostgreSQL/Redis pod never needs the network.
 # ---------------------------------------------------------------------------
-phase "Pre-importing application images"
-for tag in v1 v2; do
-  progress "Pulling ${APP_IMAGE_REPO}:${tag}" retry 3 docker pull "${APP_IMAGE_REPO}:${tag}"
+phase "Pre-importing images"
+IMAGES=("${APP_IMAGE_REPO}:v1" "${APP_IMAGE_REPO}:v2" "${POSTGRES_IMAGE}" "${REDIS_IMAGE}")
+for image in "${IMAGES[@]}"; do
+  progress "Pulling ${image}" retry 3 docker pull "${image}"
 done
-progress "Importing images into k3d" k3d image import \
-  "${APP_IMAGE_REPO}:v1" "${APP_IMAGE_REPO}:v2" -c "${CLUSTER_NAME}"
+progress "Importing images into k3d" k3d image import "${IMAGES[@]}" -c "${CLUSTER_NAME}"
 
 # ---------------------------------------------------------------------------
 # 7. Namespaces
@@ -211,7 +218,33 @@ if ! command -v argocd &> /dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# 9. GitLab SECOND — heaviest workload
+# 9. PostgreSQL + Redis for GitLab
+#
+# Since chart 10.0 (GitLab 19.0) the GitLab chart no longer bundles its
+# datastores, so we run one small instance of each from confs/gitlab-deps.yaml.
+# Passwords are generated once and never replaced: PostgreSQL only reads
+# POSTGRES_PASSWORD when it initialises its volume, so a rerun with a new
+# Secret would lock GitLab out of its own database.
+# ---------------------------------------------------------------------------
+phase "Deploying PostgreSQL and Redis"
+
+random_secret() { od -An -tx1 -N16 /dev/urandom | tr -d ' \n'; }
+
+if ! kubectl get secret gitlab-postgresql-password -n gitlab &> /dev/null; then
+  kubectl create secret generic gitlab-postgresql-password -n gitlab \
+    --from-literal=postgresql-password="$(random_secret)"
+fi
+if ! kubectl get secret gitlab-redis-secret -n gitlab &> /dev/null; then
+  kubectl create secret generic gitlab-redis-secret -n gitlab \
+    --from-literal=secret="$(random_secret)"
+fi
+
+kubectl apply -f /vagrant/confs/gitlab-deps.yaml
+progress "Waiting for PostgreSQL" kubectl rollout status deployment/postgresql -n gitlab --timeout=600s
+progress "Waiting for Redis" kubectl rollout status deployment/redis -n gitlab --timeout=300s
+
+# ---------------------------------------------------------------------------
+# 10. GitLab SECOND — heaviest workload
 # ---------------------------------------------------------------------------
 phase "Installing GitLab (this is the slow one — expect 10-20 min)"
 progress "Installing GitLab via Helm (up to 20 min)" retry 3 helm upgrade --install gitlab gitlab/gitlab \
@@ -227,12 +260,12 @@ echo "Memory/swap usage after GitLab install:"
 free -h
 
 # ---------------------------------------------------------------------------
-# 10. GitLab project: token, project creation, manifest push
+# 11. GitLab project: token, project creation, manifest push
 #
-# All of this goes through ONE kubectl port-forward. The VM is not on the pod
-# network, so it cannot resolve *.svc.cluster.local — the tunnel is how we
-# reach GitLab from here. ArgoCD itself IS in the cluster, so it uses the
-# internal DNS name directly (see step 11).
+# The API calls and the push go through ONE kubectl port-forward. The VM is not
+# on the pod network, so it cannot resolve *.svc.cluster.local — the tunnel is
+# how we reach GitLab from here. ArgoCD itself IS in the cluster, so it uses the
+# internal DNS name directly (see step 12).
 # ---------------------------------------------------------------------------
 phase "Setting up GitLab project"
 
@@ -252,38 +285,21 @@ progress "Waiting for GitLab API through tunnel" bash -c "
   done
 "
 
-# GitLab 18.x rejects username/password on the REST API, so authenticate via
-# the OAuth password grant first. That token is short-lived (~2h), so we
-# immediately use it to mint a long-lived PAT for ArgoCD.
-progress "Obtaining OAuth token" bash -c "
-  curl -fsS -X POST '${GITLAB_LOCAL_URL}/oauth/token' \
-    -d 'grant_type=password' \
-    -d 'username=root' \
-    -d 'password=${GITLAB_ROOT_PASSWORD}' \
-    -o /tmp/gitlab-oauth.json
-"
-GITLAB_OAUTH=$(grep -o '"access_token":"[^"]*"' /tmp/gitlab-oauth.json | cut -d'"' -f4)
-rm -f /tmp/gitlab-oauth.json
-
-# /api/v4/users/:id/personal_access_tokens is the ADMIN endpoint. The
-# self-service /api/v4/personal_access_tokens endpoint 404s on this version.
-PAT_EXPIRY=$(date -d '+1 year' +%Y-%m-%d)
-progress "Creating personal access token" bash -c "
-  curl -fsS -X POST '${GITLAB_LOCAL_URL}/api/v4/users/1/personal_access_tokens' \
-    -H 'Authorization: Bearer ${GITLAB_OAUTH}' \
-    -d 'name=argocd' \
-    -d 'scopes[]=api' -d 'scopes[]=read_repository' -d 'scopes[]=write_repository' \
-    -d 'expires_at=${PAT_EXPIRY}' \
-    -o /tmp/gitlab-pat.json
-"
-GITLAB_PAT=$(grep -o '"token":"[^"]*"' /tmp/gitlab-pat.json | cut -d'"' -f4)
-rm -f /tmp/gitlab-pat.json
-
-if [ -z "${GITLAB_PAT}" ]; then
-  echo "ERROR: failed to obtain a GitLab personal access token"
-  exit 1
-fi
-echo "  token acquired: ${GITLAB_PAT:0:12}..."
+# GitLab 19 removed the OAuth password grant, so the root password can no longer
+# be traded for an API token. Instead, register a token we generate ourselves
+# with the Rails runner inside the toolbox pod — the documented way to create
+# tokens programmatically. The token must be exactly 20 characters.
+GITLAB_PAT=$(od -An -tx1 -N10 /dev/urandom | tr -d ' \n')
+progress "Creating personal access token" kubectl exec -n gitlab deploy/gitlab-toolbox -- \
+  gitlab-rails runner "
+    token = User.find_by_username('root').personal_access_tokens.create(
+      scopes: ['api', 'read_repository', 'write_repository'],
+      name: 'argocd',
+      expires_at: 365.days.from_now)
+    token.set_token('${GITLAB_PAT}')
+    token.save!
+  "
+echo "  token acquired: ${GITLAB_PAT:0:6}..."
 
 # Create the project only if it does not already exist (idempotent reruns)
 PROJECT_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -322,7 +338,7 @@ progress "Pushing manifests to GitLab" bash -c "
 chown -R vagrant:vagrant "${WORK_CLONE}"
 
 # ---------------------------------------------------------------------------
-# 11. Register the repo with ArgoCD
+# 12. Register the repo with ArgoCD
 #
 # The label is the whole mechanism — without it ArgoCD ignores the Secret.
 # 'url' must match spec.source.repoURL in application.yaml byte-for-byte;
@@ -345,7 +361,7 @@ stringData:
 EOF
 
 # ---------------------------------------------------------------------------
-# 12. Convenience artifacts for the defense
+# 13. Convenience artifacts for the defense
 # ---------------------------------------------------------------------------
 phase "Writing credentials and helper script"
 
@@ -373,13 +389,13 @@ kill "${PF_PID}" 2>/dev/null || true
 trap - EXIT
 
 # ---------------------------------------------------------------------------
-# 13. Application manifest
+# 14. Application manifest
 # ---------------------------------------------------------------------------
 phase "Applying ArgoCD Application"
 kubectl apply -f /vagrant/confs/application.yaml
 
 # ---------------------------------------------------------------------------
-# 14. Summary
+# 15. Summary
 # ---------------------------------------------------------------------------
 phase "Done"
 

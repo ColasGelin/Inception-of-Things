@@ -3,6 +3,11 @@ set -euxo pipefail
 
 CLUSTER_NAME="p3-cluster"
 
+# --- curl (not guaranteed on a minimal Debian box) ---
+if ! command -v curl &> /dev/null; then
+  apt-get update -qq && apt-get install -y -qq curl
+fi
+
 # --- Docker ---
 if ! command -v docker &> /dev/null; then
   curl -fsSL https://get.docker.com | sh

@@ -2,3 +2,4 @@ en.subject.pdf
 .vagrant/
 *.box
 node-token
+.claude/

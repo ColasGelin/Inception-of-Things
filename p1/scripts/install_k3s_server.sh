@@ -7,4 +7,4 @@ set -e
 
 apt-get update && apt-get install -y net-tools curl
 
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --node-ip=${SERVER_IP} --tls-san=${SERVER_IP} --token=${TOKEN}" sh -
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --node-ip=${SERVER_IP} --tls-san=${SERVER_IP} --token=${TOKEN} --write-kubeconfig-mode=644" sh -

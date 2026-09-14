@@ -6,7 +6,11 @@ GITLAB_CHART_VERSION="9.9.2"
 
 # --- GitOps / GitLab settings ----------------------------------------------
 GITLAB_PROJECT_PATH="playground"
-GITLAB_LOCAL_PORT=8090
+# These two ports are opened permanently by the systemd units of step 10, on
+# 0.0.0.0, so the same address works inside the VM and from the host.
+VM_IP="192.168.56.120"
+GITLAB_LOCAL_PORT=8181
+ARGOCD_LOCAL_PORT=8080
 GITLAB_LOCAL_URL="http://localhost:${GITLAB_LOCAL_PORT}"
 # Port 8181 = Workhorse. Rails on 8080 serves the API but REJECTS git-over-HTTP
 # ("Nil JSON web token"), so 8181 is the only port that works for both.
@@ -227,26 +231,74 @@ echo "Memory/swap usage after GitLab install:"
 free -h
 
 # ---------------------------------------------------------------------------
-# 10. GitLab project: token, project creation, manifest push
+# 10. Permanent port forwarding (systemd)
 #
-# All of this goes through ONE kubectl port-forward. The VM is not on the pod
-# network, so it cannot resolve *.svc.cluster.local — the tunnel is how we
-# reach GitLab from here. ArgoCD itself IS in the cluster, so it uses the
-# internal DNS name directly (see step 11).
+# The VM is not on the pod network, so it cannot resolve *.svc.cluster.local:
+# a kubectl port-forward is the only way to reach GitLab and ArgoCD from here.
+# Rather than opening one by hand for every demo, install one systemd unit per
+# UI:
+#   * enabled         -> they come back on their own when the VM reboots
+#   * Restart=always  -> a forward dies with the pod it is attached to; systemd
+#     reopens it seconds later, so a rescheduled pod is not a dead link
+#   * --address 0.0.0.0 -> reachable from the host at ${VM_IP}, not only from
+#     inside the VM, which is what removes the need for a helper CLI
+#
+# ArgoCD itself IS in the cluster and still reaches GitLab over internal DNS
+# (see step 12); these tunnels exist only for humans.
+# ---------------------------------------------------------------------------
+phase "Installing permanent port-forward services"
+
+install_port_forward() {
+  local unit="$1" namespace="$2" service="$3" ports="$4" description="$5"
+
+  cat > "/etc/systemd/system/${unit}.service" <<EOF
+[Unit]
+Description=${description}
+After=docker.service
+Wants=docker.service
+
+[Service]
+Environment=KUBECONFIG=/root/.kube/config
+# Block here instead of restart-looping while the cluster is still coming up.
+ExecStartPre=/bin/bash -c 'until kubectl -n ${namespace} get svc ${service} >/dev/null 2>&1; do sleep 5; done'
+ExecStart=/usr/local/bin/kubectl port-forward --address 0.0.0.0 -n ${namespace} svc/${service} ${ports}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # Reload before enabling: on a re-provision the file we just overwrote is
+  # already loaded, and systemd would otherwise keep serving the old one.
+  systemctl daemon-reload
+  systemctl enable "${unit}.service" &> /dev/null
+  systemctl restart "${unit}.service"
+}
+
+install_port_forward gitlab-forward gitlab gitlab-webservice-default \
+  "${GITLAB_LOCAL_PORT}:8181" "GitLab web UI on port ${GITLAB_LOCAL_PORT}"
+install_port_forward argocd-forward argocd argocd-server \
+  "${ARGOCD_LOCAL_PORT}:80" "ArgoCD web UI on port ${ARGOCD_LOCAL_PORT}"
+
+systemctl is-active gitlab-forward.service argocd-forward.service || true
+echo "  GitLab UI : http://${VM_IP}:${GITLAB_LOCAL_PORT}"
+echo "  ArgoCD UI : http://${VM_IP}:${ARGOCD_LOCAL_PORT}"
+
+# ---------------------------------------------------------------------------
+# 11. GitLab project: token, project creation, manifest push
+#
+# All of this goes through the GitLab forward installed just above, which is
+# also why the working clone can push without any extra terminal.
 # ---------------------------------------------------------------------------
 phase "Setting up GitLab project"
 
 GITLAB_ROOT_PASSWORD=$(kubectl get secret gitlab-gitlab-initial-root-password \
   -n gitlab -o jsonpath='{.data.password}' | base64 -d)
 
-kubectl port-forward -n gitlab svc/gitlab-webservice-default \
-  "${GITLAB_LOCAL_PORT}:8181" &> /tmp/gitlab-port-forward.log &
-PF_PID=$!
-trap 'kill "${PF_PID}" 2>/dev/null || true' EXIT
-
 # Rails answers 401 on /api/v4/version once it is booted; a connection error or
 # 502 means it is still starting. 401 is therefore our readiness signal.
-progress "Waiting for GitLab API through tunnel" bash -c "
+progress "Waiting for GitLab API through the forward" bash -c "
   until [ \"\$(curl -s -o /dev/null -w '%{http_code}' '${GITLAB_LOCAL_URL}/api/v4/version' || true)\" = '401' ]; do
     sleep 5
   done
@@ -322,7 +374,7 @@ progress "Pushing manifests to GitLab" bash -c "
 chown -R vagrant:vagrant "${WORK_CLONE}"
 
 # ---------------------------------------------------------------------------
-# 11. Register the repo with ArgoCD
+# 12. Register the repo with ArgoCD
 #
 # The label is the whole mechanism — without it ArgoCD ignores the Secret.
 # 'url' must match spec.source.repoURL in application.yaml byte-for-byte;
@@ -345,41 +397,37 @@ stringData:
 EOF
 
 # ---------------------------------------------------------------------------
-# 12. Convenience artifacts for the defense
+# 13. Credentials for the defense
+#
+# No tunnel helper any more: both UIs are permanently forwarded (step 10), and
+# the working clone pushes to localhost:${GITLAB_LOCAL_PORT} through the very
+# same forward.
 # ---------------------------------------------------------------------------
-phase "Writing credentials and helper script"
+phase "Writing credentials"
+
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || true)
 
 cat > /home/vagrant/gitlab-creds.txt <<EOF
-GitLab root password : ${GITLAB_ROOT_PASSWORD}
-GitLab PAT (argocd)  : ${GITLAB_PAT}
-Web UI               : http://gitlab.mjeannin.com
-Repo (in-cluster)    : ${GITLAB_INTERNAL_REPO}
-Working clone        : ${WORK_CLONE}
+GitLab web UI         : http://${VM_IP}:${GITLAB_LOCAL_PORT}   (user: root)
+GitLab root password  : ${GITLAB_ROOT_PASSWORD}
+GitLab PAT (argocd)   : ${GITLAB_PAT}
+ArgoCD web UI         : http://${VM_IP}:${ARGOCD_LOCAL_PORT}   (user: admin)
+ArgoCD admin password : ${ARGOCD_PASSWORD}
+Repo (in-cluster)     : ${GITLAB_INTERNAL_REPO}
+Working clone         : ${WORK_CLONE}
 EOF
 chmod 600 /home/vagrant/gitlab-creds.txt
 chown vagrant:vagrant /home/vagrant/gitlab-creds.txt
 
-cat > /home/vagrant/gitlab-tunnel.sh <<EOF
-#!/usr/bin/env bash
-# Open a tunnel from this VM to GitLab so 'git push' from ${WORK_CLONE} works.
-# Leave it running in its own terminal; Ctrl-C to stop.
-exec kubectl port-forward -n gitlab svc/gitlab-webservice-default ${GITLAB_LOCAL_PORT}:8181
-EOF
-chmod +x /home/vagrant/gitlab-tunnel.sh
-chown vagrant:vagrant /home/vagrant/gitlab-tunnel.sh
-
-# The tunnel has done its job; ArgoCD talks to GitLab over cluster DNS.
-kill "${PF_PID}" 2>/dev/null || true
-trap - EXIT
-
 # ---------------------------------------------------------------------------
-# 13. Application manifest
+# 14. Application manifest
 # ---------------------------------------------------------------------------
 phase "Applying ArgoCD Application"
 kubectl apply -f /vagrant/confs/application.yaml
 
 # ---------------------------------------------------------------------------
-# 14. Summary
+# 15. Summary
 # ---------------------------------------------------------------------------
 phase "Done"
 
@@ -390,13 +438,15 @@ echo ""
 echo "ArgoCD Application:"
 kubectl get application -n argocd || true
 echo ""
-echo "ArgoCD initial admin password:"
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath="{.data.password}" 2>/dev/null | base64 -d || echo "(secret not found)"
+echo "Port forwards (systemd, restored on every boot):"
+systemctl is-active gitlab-forward.service argocd-forward.service || true
 echo ""
+echo "Web UIs, already reachable from the host — nothing to start:"
+echo "  GitLab  http://${VM_IP}:${GITLAB_LOCAL_PORT}   root  / ${GITLAB_ROOT_PASSWORD}"
+echo "  ArgoCD  http://${VM_IP}:${ARGOCD_LOCAL_PORT}   admin / ${ARGOCD_PASSWORD}"
+echo "  App     http://${VM_IP}:8888"
 echo ""
-echo "GitLab credentials written to /home/vagrant/gitlab-creds.txt"
-echo "Tunnel helper:              /home/vagrant/gitlab-tunnel.sh"
-echo "Working clone:              ${WORK_CLONE}"
+echo "Credentials also written to: /home/vagrant/gitlab-creds.txt"
+echo "Working clone:               ${WORK_CLONE}"
 echo ""
 echo "Total provisioning time: ${SECONDS}s"

@@ -27,6 +27,10 @@ VM 192.168.56.120 (Debian 13 (Trixie), 5 CPUs, 5 GB RAM + 4 GB swap)
 
 k3d load balancer:  VM :80   → Traefik → GitLab Ingress (gitlab.mjeannin.com)
                     VM :8888 → playground Service
+
+systemd port-forwards (started at boot, see step 11):
+                    VM :8181 → svc/gitlab-webservice-default   (GitLab UI)
+                    VM :8080 → svc/argocd-server               (Argo CD UI)
 ```
 
 The key point: **Argo CD reaches GitLab through the cluster's internal DNS** (`<service>.<namespace>.svc.cluster.local`), the same way microservices talk to each other in production.
@@ -37,7 +41,6 @@ The key point: **Argo CD reaches GitLab through the cluster's internal DNS** (`<
 |---|---|
 | `Vagrantfile` | One Debian 13 (Trixie) VM, IP `192.168.56.120`, 5 CPUs / 5 GB RAM, `confs/` rsynced to `/vagrant/confs` |
 | `scripts/bootstrap.sh` | Provisions everything: tooling, cluster, Argo CD, GitLab, project, token, repo registration |
-| `scripts/cli.sh` | Interactive menu, run **from the host**, to open or close access to the GitLab web UI and print the root password |
 | `confs/argocd-values.yaml` | Helm values for Argo CD: small resource requests, unused components disabled, 60s sync interval |
 | `confs/gitlab-values.yaml` | Helm values for GitLab: minimal CE install tuned to fit in a small VM, plugged into the external PostgreSQL/Redis and K3s's Traefik |
 | `confs/gitlab-deps.yaml` | PostgreSQL 17 and Redis 7.2 for GitLab (the chart stopped bundling them in 10.0) |
@@ -115,8 +118,33 @@ The heaviest step (10–20 min). `gitlab-values.yaml` trims the chart down to th
 | `psql.host: postgresql.gitlab.svc`, `redis.host: redis.gitlab.svc`, passwords from Secrets | The external datastores from step 9 |
 | `appConfig.lfs/artifacts/uploads/packages.enabled: false` | These require S3 object storage now that MinIO is gone, and aren't needed to host a Git repo |
 
-### 11. GitLab project, token and first push
-The VM isn't on the pod network, so it can't resolve `*.svc.cluster.local`. The script opens a temporary `kubectl port-forward` to the GitLab webservice (`localhost:8090 → :8181`) for the API calls and the push:
+### 11. Automatic port forwarding (systemd)
+The VM isn't on the pod network, so it can't resolve `*.svc.cluster.local`: a `kubectl port-forward` is the only way to reach GitLab and Argo CD from outside the cluster. Instead of opening one by hand before every demo, the bootstrap installs **one systemd unit per UI**:
+
+| Unit | Forward |
+|---|---|
+| `gitlab-forward.service` | `svc/gitlab-webservice-default` → `0.0.0.0:8181` |
+| `argocd-forward.service` | `svc/argocd-server` → `0.0.0.0:8080` |
+
+```ini
+[Service]
+Environment=KUBECONFIG=/root/.kube/config
+ExecStartPre=/bin/bash -c 'until kubectl -n gitlab get svc gitlab-webservice-default >/dev/null 2>&1; do sleep 5; done'
+ExecStart=/usr/local/bin/kubectl port-forward --address 0.0.0.0 -n gitlab svc/gitlab-webservice-default 8181:8181
+Restart=always
+RestartSec=5
+```
+
+Three details make this work unattended:
+
+- **`--address 0.0.0.0`** — the forward listens on every interface of the VM, so the host reaches it at `192.168.56.120`, not just `localhost` inside the VM.
+- **`Restart=always`** — a `port-forward` is bound to one pod and dies with it. systemd reopens it a few seconds later, so a rescheduled GitLab or Argo CD pod doesn't leave a dead link.
+- **`enable` + `ExecStartPre`** — the units are enabled, so they start again when the VM reboots; the `ExecStartPre` loop simply waits for the cluster to come back instead of restart-looping in the meantime.
+
+Argo CD itself is *in* the cluster and keeps talking to GitLab over internal DNS (step 13). These forwards exist only for humans — and for the working clone, which pushes to `localhost:8181` through the same one.
+
+### 12. GitLab project, token and first push
+Everything below goes through the GitLab forward from step 11:
 
 1. **Wait for the API**: polls `/api/v4/version` until it returns `401`. That means Rails has booted and is refusing an unauthenticated request. A connection error or a `502` means it's still starting.
 2. **Personal access token (PAT)**: GitLab 19 removed the OAuth password grant, so the root password can't be traded for an API token anymore. The script generates a random 20-character token and registers it for `root` with `gitlab-rails runner` inside the toolbox pod (scopes `api`, `read_repository`, `write_repository`, valid one year).
@@ -125,7 +153,7 @@ The VM isn't on the pod network, so it can't resolve `*.svc.cluster.local`. The 
 
 > Port **8181** is GitLab **Workhorse**, the front proxy that handles Git over HTTP. Rails on port 8080 serves the API but rejects git clone/push, so 8181 is the only port that works for both.
 
-### 12. Register the repo with Argo CD
+### 13. Register the repo with Argo CD
 Creates a Secret in `argocd` holding the repo URL and the PAT:
 
 ```yaml
@@ -141,14 +169,11 @@ stringData:
 
 Argo CD matches credentials to Applications by comparing the URL **exactly**, so `url` has to match `spec.source.repoURL` in `application.yaml` character for character.
 
-### 13. Helpers for the defense
-- `/home/vagrant/gitlab-creds.txt`: root password, PAT, URLs (mode `600`)
-- `/home/vagrant/gitlab-tunnel.sh`: reopens the port-forward so `git push` works from the working clone
+### 14. Credentials for the defense
+`/home/vagrant/gitlab-creds.txt` (mode `600`) holds both URLs, the GitLab `root` password, the PAT and the Argo CD `admin` password. There's no tunnel helper to run: the forwards from step 11 are already up.
 
-The temporary tunnel is then closed. Argo CD doesn't need it, since it talks to GitLab over cluster DNS.
-
-### 14–15. Apply the Application and print a summary
-Applies `confs/application.yaml` (same auto-sync, `prune` and `selfHeal` policy as Part 3), then prints the pods, the Application status, the Argo CD admin password and the total provisioning time.
+### 15–16. Apply the Application and print a summary
+Applies `confs/application.yaml` (same auto-sync, `prune` and `selfHeal` policy as Part 3), then prints the pods, the Application status, the state of the two forward units, both URLs with their passwords, and the total provisioning time.
 
 ## Usage
 
@@ -167,45 +192,34 @@ kubectl get application -n argocd     # playground: Synced / Healthy
 curl http://localhost:8888/           # {"status":"ok", "message": "v1"}
 ```
 
-### Open the GitLab web UI
+### Open the web UIs
 
-From the host, in `bonus/`:
+Nothing to start — the forwards come up with the VM (step 11). Straight from the host's browser:
 
-```bash
-./scripts/cli.sh
-```
+| UI | URL | Login |
+|---|---|---|
+| GitLab | `http://192.168.56.120:8181` | `root` |
+| Argo CD | `http://192.168.56.120:8080` | `admin` |
+| Playground app | `http://192.168.56.120:8888` | — |
 
-| Command | Effect |
-|---|---|
-| `1` activate | Runs `kubectl port-forward --address 0.0.0.0 ... 8181:8181` in the VM, in the background |
-| `2` deactivate | Stops the port-forward |
-| `3` status | Shows whether the port-forward is running |
-| `4` password | Prints the GitLab `root` password |
-| `5` url | Prints `http://192.168.56.120:8181` |
-
-Open `http://192.168.56.120:8181` and log in as `root`.
-
-Alternatively, go through the Ingress by adding `192.168.56.120 gitlab.mjeannin.com` to `/etc/hosts` on the host and opening `http://gitlab.mjeannin.com`.
-
-### Open the Argo CD UI
+Both passwords are printed at the end of `vagrant up` and stored in the VM:
 
 ```bash
-vagrant ssh -c "kubectl port-forward --address 0.0.0.0 svc/argocd-server -n argocd 8080:80"
-vagrant ssh -c "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo"
+vagrant ssh -c "cat gitlab-creds.txt"
 ```
 
-Open `http://192.168.56.120:8080` and log in as `admin`.
+If a UI ever stops answering, the unit — not you — is what to look at:
+
+```bash
+vagrant ssh -c "systemctl status gitlab-forward argocd-forward"
+vagrant ssh -c "sudo systemctl restart gitlab-forward"
+```
+
+GitLab is also reachable through the Ingress by adding `192.168.56.120 gitlab.mjeannin.com` to `/etc/hosts` on the host and opening `http://gitlab.mjeannin.com`.
 
 ### Demo: deploy v2 through GitLab
 
-Terminal 1 (VM), open the tunnel:
-
-```bash
-vagrant ssh
-./gitlab-tunnel.sh
-```
-
-Terminal 2 (VM), change the version and push:
+One terminal is enough — the working clone pushes through the permanent forward:
 
 ```bash
 vagrant ssh

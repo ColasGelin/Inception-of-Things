@@ -6,7 +6,7 @@ GITLAB_CHART_VERSION="9.9.2"
 
 # --- GitOps / GitLab settings ----------------------------------------------
 GITLAB_PROJECT_PATH="playground"
-# These two ports are opened permanently by the systemd units of step 10, on
+# These two ports are opened permanently by the systemd units of step 11, on
 # 0.0.0.0, so the same address works inside the VM and from the host.
 VM_IP="192.168.56.120"
 GITLAB_LOCAL_PORT=8181
@@ -110,38 +110,56 @@ free -h
 
 # ---------------------------------------------------------------------------
 # 3. Tooling
+#
+# Five independent downloads. git and Docker both go through apt, so they share
+# one branch (dpkg takes an exclusive lock); kubectl, k3d and Helm are plain
+# binary fetches and run alongside them. The phase costs its slowest branch
+# instead of the sum of all five.
 # ---------------------------------------------------------------------------
 phase "Installing tooling"
 
-if ! command -v git &> /dev/null; then
-  progress "Installing git" bash -c 'apt-get update -qq && apt-get install -y -qq git'
-fi
+progress "Installing git, Docker, kubectl, k3d and Helm (in parallel)" bash -c '
+  set -eu
+  pids=""
 
-if ! command -v docker &> /dev/null; then
-  progress "Installing Docker" bash -c 'curl -fsSL https://get.docker.com | sh'
-fi
+  # One branch for everything apt-based: dpkg would refuse to run these at the
+  # same time anyway.
+  (
+    command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq git; }
+    command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh
+  ) &
+  pids="$pids $!"
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    (
+      v=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+      curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${v}/bin/linux/amd64/kubectl"
+      install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      rm -f /tmp/kubectl
+    ) &
+    pids="$pids $!"
+  fi
+
+  if ! command -v k3d >/dev/null 2>&1; then
+    ( curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash ) &
+    pids="$pids $!"
+  fi
+
+  if ! command -v helm >/dev/null 2>&1; then
+    (
+      curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      chmod 700 /tmp/get_helm.sh
+      /tmp/get_helm.sh
+      rm -f /tmp/get_helm.sh
+    ) &
+    pids="$pids $!"
+  fi
+
+  rc=0
+  for pid in $pids; do wait "$pid" || rc=1; done
+  exit $rc
+'
 usermod -aG docker vagrant
-
-if ! command -v kubectl &> /dev/null; then
-  progress "Installing kubectl" bash -c '
-    curl -sLO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-    rm -f kubectl
-  '
-fi
-
-if ! command -v k3d &> /dev/null; then
-  progress "Installing k3d" bash -c 'curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash'
-fi
-
-if ! command -v helm &> /dev/null; then
-  progress "Installing Helm" bash -c '
-    curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-    chmod 700 /tmp/get_helm.sh
-    /tmp/get_helm.sh
-    rm -f /tmp/get_helm.sh
-  '
-fi
 
 docker --version
 kubectl version --client
@@ -159,12 +177,16 @@ progress "Updating repos" helm repo update
 # ---------------------------------------------------------------------------
 # 5. k3d cluster
 # ---------------------------------------------------------------------------
+# GitLab no longer publishes an Ingress (see confs/gitlab-values.yaml) and the
+# playground Service is a LoadBalancer served by k3s's own servicelb, so
+# Traefik has nothing left to route: disabling it drops a Helm-install job, a
+# pod and an image pull from the critical path. Port 80 goes with it.
 phase "Creating k3d cluster"
 if ! k3d cluster list | grep -q "${CLUSTER_NAME}"; then
   progress "Creating k3d cluster ${CLUSTER_NAME}" k3d cluster create "${CLUSTER_NAME}" \
-    -p "80:80@loadbalancer" \
     -p "8888:8888@loadbalancer" \
     --k3s-arg "--disable=metrics-server@server:0" \
+    --k3s-arg "--disable=traefik@server:0" \
     --wait
 fi
 
@@ -173,20 +195,34 @@ cp /root/.kube/config /home/vagrant/.kube/config
 chown -R vagrant:vagrant /home/vagrant/.kube
 
 # ---------------------------------------------------------------------------
-# 6. Pre-import application images
+# 6. Pre-import application images — started here, collected in step 10
 #
 # Pull on the HOST and side-load into the k3d nodes so the kubelet never has to
 # reach Docker Hub. With GitLab running this VM is memory-starved, CoreDNS gets
 # flaky, and in-cluster image pulls fail with "lookup registry-1.docker.io:
 # Try again". Importing both tags up front makes the v1 -> v2 demo immune to
 # that (and to Docker Hub rate limits).
+#
+# Nothing needs these images until Argo CD syncs, several minutes from now, so
+# the download runs in the background and overlaps GitLab's startup instead of
+# sitting in front of it. The Argo CD CLI rides along: it is a convenience for
+# the defense, not something this script uses.
 # ---------------------------------------------------------------------------
-phase "Pre-importing application images"
-for tag in v1 v2; do
-  progress "Pulling ${APP_IMAGE_REPO}:${tag}" retry 3 docker pull "${APP_IMAGE_REPO}:${tag}"
-done
-progress "Importing images into k3d" k3d image import \
-  "${APP_IMAGE_REPO}:v1" "${APP_IMAGE_REPO}:v2" -c "${CLUSTER_NAME}"
+phase "Starting background downloads"
+(
+  for tag in v1 v2; do
+    retry 3 docker pull "${APP_IMAGE_REPO}:${tag}"
+  done
+  k3d image import "${APP_IMAGE_REPO}:v1" "${APP_IMAGE_REPO}:v2" -c "${CLUSTER_NAME}"
+
+  if ! command -v argocd &> /dev/null; then
+    curl -sSfL -o /tmp/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+    install -m 555 /tmp/argocd /usr/local/bin/argocd
+    rm -f /tmp/argocd
+  fi
+) &> /tmp/background-downloads.log &
+DOWNLOADS_PID=$!
+echo "  running in the background (pid ${DOWNLOADS_PID}, log /tmp/background-downloads.log)"
 
 # ---------------------------------------------------------------------------
 # 7. Namespaces
@@ -197,7 +233,27 @@ for ns in gitlab argocd dev; do
 done
 
 # ---------------------------------------------------------------------------
-# 8. ArgoCD FIRST — lighter, fails fast if something's wrong
+# 8. GitLab FIRST, and deliberately without --wait
+#
+# GitLab is the long pole: database migrations plus a Rails boot that nothing
+# can shorten. `helm upgrade --install` without `--wait` returns as soon as the
+# objects exist, so the cluster starts pulling images and migrating while this
+# script goes on to install Argo CD and collect the background downloads.
+# Waiting on the whole release would have serialised all of that behind it.
+#
+# The readiness gate has not disappeared, it has moved to step 12, where we
+# poll the GitLab API — which is the thing we actually depend on, and a far
+# tighter condition than "every pod in the release is ready".
+# ---------------------------------------------------------------------------
+phase "Installing GitLab (starts booting in the background)"
+progress "Applying GitLab chart" retry 3 helm upgrade --install gitlab gitlab/gitlab \
+  --namespace gitlab \
+  --version "${GITLAB_CHART_VERSION}" \
+  --values /vagrant/confs/gitlab-values.yaml \
+  --timeout 1200s
+
+# ---------------------------------------------------------------------------
+# 9. ArgoCD — installed while GitLab boots
 # ---------------------------------------------------------------------------
 phase "Installing ArgoCD"
 progress "Installing ArgoCD via Helm (up to 10 min)" retry 3 helm upgrade --install argocd argo/argo-cd \
@@ -206,32 +262,20 @@ progress "Installing ArgoCD via Helm (up to 10 min)" retry 3 helm upgrade --inst
   --wait \
   --timeout 600s
 
-if ! command -v argocd &> /dev/null; then
-  progress "Installing ArgoCD CLI" bash -c '
-    curl -sSfL -o /tmp/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-    install -m 555 /tmp/argocd /usr/local/bin/argocd
-    rm -f /tmp/argocd
-  '
+# ---------------------------------------------------------------------------
+# 10. Collect the background downloads from step 6
+# ---------------------------------------------------------------------------
+phase "Collecting background downloads"
+if wait "${DOWNLOADS_PID}"; then
+  echo "  application images imported, argocd CLI installed"
+else
+  echo "  FAILED — output follows"
+  sed 's/^/  /' /tmp/background-downloads.log
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# 9. GitLab SECOND — heaviest workload
-# ---------------------------------------------------------------------------
-phase "Installing GitLab (this is the slow one — expect 10-20 min)"
-progress "Installing GitLab via Helm (up to 20 min)" retry 3 helm upgrade --install gitlab gitlab/gitlab \
-  --namespace gitlab \
-  --version "${GITLAB_CHART_VERSION}" \
-  --values /vagrant/confs/gitlab-values.yaml \
-  --wait \
-  --timeout 1200s
-
-phase "GitLab ready"
-kubectl get pods -n gitlab
-echo "Memory/swap usage after GitLab install:"
-free -h
-
-# ---------------------------------------------------------------------------
-# 10. Permanent port forwarding (systemd)
+# 11. Permanent port forwarding (systemd)
 #
 # The VM is not on the pod network, so it cannot resolve *.svc.cluster.local:
 # a kubectl port-forward is the only way to reach GitLab and ArgoCD from here.
@@ -244,7 +288,7 @@ free -h
 #     inside the VM, which is what removes the need for a helper CLI
 #
 # ArgoCD itself IS in the cluster and still reaches GitLab over internal DNS
-# (see step 12); these tunnels exist only for humans.
+# (see step 13); these tunnels exist only for humans.
 # ---------------------------------------------------------------------------
 phase "Installing permanent port-forward services"
 
@@ -286,10 +330,11 @@ echo "  GitLab UI : http://${VM_IP}:${GITLAB_LOCAL_PORT}"
 echo "  ArgoCD UI : http://${VM_IP}:${ARGOCD_LOCAL_PORT}"
 
 # ---------------------------------------------------------------------------
-# 11. GitLab project: token, project creation, manifest push
+# 12. GitLab project: token, project creation, manifest push
 #
-# All of this goes through the GitLab forward installed just above, which is
-# also why the working clone can push without any extra terminal.
+# This is where we finally block on GitLab, through the forward installed just
+# above — which is also why the working clone can push without any extra
+# terminal.
 # ---------------------------------------------------------------------------
 phase "Setting up GitLab project"
 
@@ -303,6 +348,12 @@ progress "Waiting for GitLab API through the forward" bash -c "
     sleep 5
   done
 "
+
+echo ""
+kubectl get pods -n gitlab
+echo "Memory/swap usage now that GitLab is up:"
+free -h
+echo ""
 
 # GitLab 18.x rejects username/password on the REST API, so authenticate via
 # the OAuth password grant first. That token is short-lived (~2h), so we
@@ -373,8 +424,28 @@ progress "Pushing manifests to GitLab" bash -c "
 "
 chown -R vagrant:vagrant "${WORK_CLONE}"
 
+# Prove the push landed somewhere ArgoCD can clone from. This is the check that
+# backs the disabled Sidekiq: if skipping the post-receive background jobs ever
+# did break repository bookkeeping, it surfaces HERE, during provisioning, with
+# a fix attached — not on defense day.
+if ! progress "Verifying the repository serves its content back" bash -c "
+  [ \"\$(curl -s -o /dev/null -w '%{http_code}' \
+      -H 'PRIVATE-TOKEN: ${GITLAB_PAT}' \
+      '${GITLAB_LOCAL_URL}/api/v4/projects/root%2F${GITLAB_PROJECT_PATH}/repository/files/manifests%2Fdeployment.yaml?ref=main')\" = '200' ]
+"; then
+  cat <<'MSG'
+
+  ERROR: the manifests were pushed, but GitLab will not serve them back.
+
+  Set `gitlab.sidekiq.enabled: true` in confs/gitlab-values.yaml and re-run
+  `vagrant provision`. Everything else in this script is unaffected.
+
+MSG
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
-# 12. Register the repo with ArgoCD
+# 13. Register the repo with ArgoCD
 #
 # The label is the whole mechanism — without it ArgoCD ignores the Secret.
 # 'url' must match spec.source.repoURL in application.yaml byte-for-byte;
@@ -397,9 +468,9 @@ stringData:
 EOF
 
 # ---------------------------------------------------------------------------
-# 13. Credentials for the defense
+# 14. Credentials for the defense
 #
-# No tunnel helper any more: both UIs are permanently forwarded (step 10), and
+# No tunnel helper any more: both UIs are permanently forwarded (step 11), and
 # the working clone pushes to localhost:${GITLAB_LOCAL_PORT} through the very
 # same forward.
 # ---------------------------------------------------------------------------
@@ -421,13 +492,13 @@ chmod 600 /home/vagrant/gitlab-creds.txt
 chown vagrant:vagrant /home/vagrant/gitlab-creds.txt
 
 # ---------------------------------------------------------------------------
-# 14. Application manifest
+# 15. Application manifest
 # ---------------------------------------------------------------------------
 phase "Applying ArgoCD Application"
 kubectl apply -f /vagrant/confs/application.yaml
 
 # ---------------------------------------------------------------------------
-# 15. Summary
+# 16. Summary
 # ---------------------------------------------------------------------------
 phase "Done"
 

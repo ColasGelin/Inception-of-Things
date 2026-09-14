@@ -10,10 +10,9 @@ VM 192.168.56.120 (Debian 13 (Trixie), 5 CPUs, 5 GB RAM + 4 GB swap)
    └─ k3d cluster "p3-cluster"
       │
       ├─ namespace gitlab ─────────────────────────────────────────────┐
-      │   GitLab CE (Helm chart 10.3.2)                                │
-      │   webservice (Rails + Workhorse :8181), gitaly, sidekiq,       │
-      │   toolbox, migrations                                          │
-      │   + PostgreSQL 17, Redis 7.2 (confs/gitlab-deps.yaml)          │
+      │   GitLab CE (Helm chart 9.9.2 = GitLab 18.9), stripped to      │
+      │   four pods: webservice (Rails + Workhorse :8181), gitaly,     │
+      │   postgresql, redis  — plus two one-shot Jobs                  │
       │   repo: root/playground  ── manifests/deployment.yaml          │
       │                             manifests/service.yaml             │
       │                                                                │
@@ -25,8 +24,7 @@ VM 192.168.56.120 (Debian 13 (Trixie), 5 CPUs, 5 GB RAM + 4 GB swap)
       └─ namespace dev
           playground (wil42/playground:v1 / v2)
 
-k3d load balancer:  VM :80   → Traefik → GitLab Ingress (gitlab.mjeannin.com)
-                    VM :8888 → playground Service
+k3d load balancer:  VM :8888 → playground Service (k3s servicelb)
 
 systemd port-forwards (started at boot, see step 11):
                     VM :8181 → svc/gitlab-webservice-default   (GitLab UI)
@@ -42,8 +40,7 @@ The key point: **Argo CD reaches GitLab through the cluster's internal DNS** (`<
 | `Vagrantfile` | One Debian 13 (Trixie) VM, IP `192.168.56.120`, 5 CPUs / 5 GB RAM, `confs/` rsynced to `/vagrant/confs` |
 | `scripts/bootstrap.sh` | Provisions everything: tooling, cluster, Argo CD, GitLab, project, token, repo registration |
 | `confs/argocd-values.yaml` | Helm values for Argo CD: small resource requests, unused components disabled, 60s sync interval |
-| `confs/gitlab-values.yaml` | Helm values for GitLab: minimal CE install tuned to fit in a small VM, plugged into the external PostgreSQL/Redis and K3s's Traefik |
-| `confs/gitlab-deps.yaml` | PostgreSQL 17 and Redis 7.2 for GitLab (the chart stopped bundling them in 10.0) |
+| `confs/gitlab-values.yaml` | Helm values for GitLab: every component that isn't needed to serve one repo over HTTP, switched off |
 | `confs/application.yaml` | Argo CD `Application` pointing at the in-cluster GitLab repo |
 | `confs/manifests/*.yaml` | Initial app manifests, pushed to GitLab by the bootstrap |
 | `IoT_commands_p3.md` | Notes for moving VirtualBox and Vagrant storage to `goinfre` on 42 machines |
@@ -65,7 +62,7 @@ Loops until `charts.gitlab.io` responds, to avoid failing right at boot because 
 Creates a 4 GB `/swapfile`. GitLab uses a lot of memory, and without swap the kernel's OOM killer can kill its pods during startup.
 
 ### 3. Tooling
-Installs `curl` (if missing), `git`, Docker, `kubectl`, `k3d` and `helm`, each only if it's missing.
+Installs `git`, Docker, `kubectl`, `k3d` and `helm`, each only if it's missing — and **in parallel**. `git` and Docker share one branch because both go through `apt` and dpkg holds an exclusive lock; `kubectl`, `k3d` and `helm` are plain binary downloads and run alongside. The phase costs its slowest branch rather than the sum of all five.
 
 ### 4. Helm repositories
 Adds the `gitlab` and `argo` chart repositories (with retries).
@@ -73,50 +70,65 @@ Adds the `gitlab` and `argo` chart repositories (with retries).
 ### 5. k3d cluster
 ```bash
 k3d cluster create p3-cluster \
-  -p "80:80@loadbalancer" \          # Traefik -> GitLab Ingress
-  -p "8888:8888@loadbalancer" \      # playground app
+  -p "8888:8888@loadbalancer" \                     # playground app
   --k3s-arg "--disable=metrics-server@server:0" \   # one less component eating RAM
+  --k3s-arg "--disable=traefik@server:0" \          # nothing left for it to route
   --wait
 ```
 
-### 6. Pre-import images
-`wil42/playground:v1` and `v2` (and the `postgres` and `redis` images) are pulled **on the VM** and loaded into the k3d node with `k3d image import`. With GitLab running, the VM is short on memory, CoreDNS can get flaky, and in-cluster pulls from Docker Hub can fail. Pre-loading them makes the v1 → v2 demo independent of the network and of Docker Hub rate limits.
+Traefik is gone because GitLab no longer publishes an Ingress (step 10) and the playground Service is a `LoadBalancer` handled by K3s's own `servicelb`. That removes a Helm-install Job, a pod and an image pull. Port 80 goes with it.
+
+### 6. Pre-import images (in the background)
+`wil42/playground:v1` and `v2` are pulled **on the VM** and loaded into the k3d node with `k3d image import`. With GitLab running, the VM is short on memory, CoreDNS can get flaky, and in-cluster pulls from Docker Hub can fail. Pre-loading them makes the v1 → v2 demo independent of the network and of Docker Hub rate limits.
+
+Nothing needs these images until Argo CD syncs, several minutes later, so the download is **started here and collected in step 10**, overlapping GitLab's startup instead of sitting in front of it. The `argocd` CLI — a convenience for the defense, never used by the script — rides along in the same background branch.
 
 ### 7. Namespaces
 Creates `gitlab`, `argocd` and `dev` (idempotently).
 
-### 8. Argo CD (Helm)
-Installed **first** because it's lighter and fails fast if something is wrong with the cluster. `argocd-values.yaml`:
+### 8. GitLab (Helm) — first, and deliberately without `--wait`
+
+GitLab is the long pole: database migrations plus a Rails boot that nothing can shorten. `helm upgrade --install` **without** `--wait` returns as soon as the objects exist, so the cluster starts pulling images and migrating while the script goes on to install Argo CD and collect the background downloads. Waiting on the whole release would have serialised all of that behind it.
+
+The readiness gate hasn't disappeared, it has *moved* — to step 12, where the script polls `/api/v4/version`. That is both the thing we actually depend on and a tighter condition than "every pod in the release is ready".
+
+#### What `gitlab-values.yaml` leaves running
+
+This instance has one job: host `root/playground` over HTTP. Every component off that path is switched off, because each one is an image to pull *and* memory the webservice has to compete for — and memory pressure is what makes the first boot slow, as Rails gets pushed into swap.
+
+| Turned off | What it is | Why we don't need it |
+|---|---|---|
+| `gitlab.sidekiq` | background job runner | Creating the project and writing the repository both happen synchronously through Rails and Gitaly; Argo CD clones from Gitaly. The single biggest win — close to a gigabyte |
+| `gitlab.toolbox` | backup / rails-console pod | The bootstrap drives GitLab through the REST API |
+| `global.minio` | object storage | Only backs LFS, artifacts, uploads and packages, all disabled |
+| `global.kas` | agent server for the k8s integration | Argo CD is what talks to the cluster here |
+| `global.ingress` | Ingress objects | The UI comes through the port-forward, Argo CD through cluster DNS |
+| `gitlab.gitlab-shell` | SSH access | Git over HTTP only |
+| `gitlab.gitlab-exporter`, `postgresql.metrics` | Prometheus exporters | Prometheus is off; the exporter was a sidecar running for nothing |
+| `registry`, `gitlab-pages`, `gitlab-runner`, `gitlab-zoekt`, `upgradeCheck`, `certmanager` | registry, Pages, CI, code search, version check, TLS | None of it is on the path |
+
+Disabling MinIO **forces** `appConfig.lfs/artifacts/uploads/packages.enabled: false`: the chart refuses to render otherwise ("the `connection` property can not be empty"). What's left is `webservice` (Rails + Workhorse), `gitaly`, `postgresql`, `redis`, and the `migrations` and `shared-secrets` Jobs.
+
+Rendering the chart before and after:
+
+| | pods | Jobs | Ingresses | distinct images |
+|---|---|---|---|---|
+| before | 8 | 4 | 3 | 14 |
+| after | **4** | **2** | **0** | **9** |
+
+The webservice is then *given back* some of what the others freed — `requests: 1Gi`, `limits: 2Gi`. A tight limit is a false economy here: an OOMKill costs a two-minute restart.
+
+> One knob in that table carries real risk: **Sidekiq**. It should be safe — nothing we do depends on background jobs — but rather than trust that, step 12 verifies after the push that GitLab really serves the manifests back. If it ever doesn't, the provision fails right there with the fix attached: set `gitlab.sidekiq.enabled: true` and re-run `vagrant provision`.
+
+### 9. Argo CD (Helm) — while GitLab boots
+`argocd-values.yaml`:
 - lowers the resource requests so the scheduler can fit everything
 - disables `applicationSet`, `notifications` and `dex` (SSO), none of which are used here
 - sets `server.insecure: true` so the UI is served over plain HTTP
 - sets `timeout.reconciliation: 60s` so Argo CD checks Git every minute instead of every 3
 
-The `argocd` CLI is installed as well.
-
-### 9. PostgreSQL and Redis
-Since Helm chart 10.0 (GitLab 19.0), the GitLab chart **no longer ships PostgreSQL, Redis or MinIO**. `confs/gitlab-deps.yaml` runs one small instance of each datastore in the `gitlab` namespace:
-
-- **PostgreSQL 17** (the only major version GitLab 19 supports) with a 2 GiB volume. Its user is a superuser, so GitLab's migrations can create the extensions they need (`pg_trgm`, `btree_gist`, `amcheck`).
-- **Redis 7.2** (the version GitLab recommends), password protected.
-
-Both passwords are random and stored in Secrets (`gitlab-postgresql-password`, `gitlab-redis-secret`). They are created **once** and never replaced on a rerun: PostgreSQL only reads its password when it first initialises the volume, so a new Secret would lock GitLab out of its database. The script waits until both pods are ready before installing GitLab.
-
-MinIO isn't replaced: object storage is only needed for LFS, CI artifacts, uploads and packages, which are disabled (see below).
-
-### 10. GitLab (Helm)
-The heaviest step (10–20 min). `gitlab-values.yaml` trims the chart down to the minimum:
-
-| Setting | Why |
-|---|---|
-| `edition: ce`, `hosts.domain: mjeannin.com`, `https: false` | Community edition, reachable at `gitlab.mjeannin.com` over HTTP |
-| `gatewayApi.enabled: false`, `gatewayApi.installEnvoy: false` | Chart 10.x defaults to Gateway API with its own Envoy Gateway. We don't need a second proxy |
-| `ingress.enabled: true`, `ingress.provider/class: traefik`, `nginx-ingress.enabled: false` | Use a plain Ingress on the Traefik controller K3s already ships |
-| `installCertmanager: false` | No TLS certificates needed locally |
-| `prometheus`, `gitlab-runner`, `registry`, `gitlab-pages`, `kas`, `gitlab-shell` disabled | Features not needed for a Git repo served over HTTP |
-| 1 webservice replica, 1 worker process, 1 sidekiq replica, small requests and limits | Fit into ~5 GB of RAM |
-| `psql.host: postgresql.gitlab.svc`, `redis.host: redis.gitlab.svc`, passwords from Secrets | The external datastores from step 9 |
-| `appConfig.lfs/artifacts/uploads/packages.enabled: false` | These require S3 object storage now that MinIO is gone, and aren't needed to host a Git repo |
+### 10. Collect the background downloads
+`wait` on the branch started in step 6. By now it has almost always finished, so this costs nothing — it exists to turn a failed download into a clear error instead of a mysterious `ImagePullBackOff` later.
 
 ### 11. Automatic port forwarding (systemd)
 The VM isn't on the pod network, so it can't resolve `*.svc.cluster.local`: a `kubectl port-forward` is the only way to reach GitLab and Argo CD from outside the cluster. Instead of opening one by hand before every demo, the bootstrap installs **one systemd unit per UI**:
@@ -144,12 +156,13 @@ Three details make this work unattended:
 Argo CD itself is *in* the cluster and keeps talking to GitLab over internal DNS (step 13). These forwards exist only for humans — and for the working clone, which pushes to `localhost:8181` through the same one.
 
 ### 12. GitLab project, token and first push
-Everything below goes through the GitLab forward from step 11:
+This is where the script finally blocks on GitLab, through the forward from step 11:
 
 1. **Wait for the API**: polls `/api/v4/version` until it returns `401`. That means Rails has booted and is refusing an unauthenticated request. A connection error or a `502` means it's still starting.
 2. **Personal access token (PAT)**: GitLab 19 removed the OAuth password grant, so the root password can't be traded for an API token anymore. The script generates a random 20-character token and registers it for `root` with `gitlab-rails runner` inside the toolbox pod (scopes `api`, `read_repository`, `write_repository`, valid one year).
 3. **Project**: creates the public project `root/playground` if it doesn't exist yet.
 4. **Push**: builds a Git repo in `/home/vagrant/playground` with the manifests from `confs/manifests/` and pushes it to `main`. The clone is kept as a working copy for the demo.
+5. **Verify**: asks the API for `manifests/deployment.yaml` at `ref=main` and requires a `200`. This proves the push landed somewhere Argo CD can clone from, and is what backs the decision to run without Sidekiq — a failure surfaces here, during provisioning, not on defense day.
 
 > Port **8181** is GitLab **Workhorse**, the front proxy that handles Git over HTTP. Rails on port 8080 serves the API but rejects git clone/push, so 8181 is the only port that works for both.
 
@@ -214,8 +227,6 @@ If a UI ever stops answering, the unit — not you — is what to look at:
 vagrant ssh -c "systemctl status gitlab-forward argocd-forward"
 vagrant ssh -c "sudo systemctl restart gitlab-forward"
 ```
-
-GitLab is also reachable through the Ingress by adding `192.168.56.120 gitlab.mjeannin.com` to `/etc/hosts` on the host and opening `http://gitlab.mjeannin.com`.
 
 ### Demo: deploy v2 through GitLab
 

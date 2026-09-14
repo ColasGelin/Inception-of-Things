@@ -1,91 +1,141 @@
+# Barebones GitLab CE.
+#
+# This instance has exactly one job: host root/playground over HTTP so Argo CD
+# can clone it and we can push a new image tag to it. Everything that is not on
+# that path is turned off — each extra component is an image to pull AND memory
+# the webservice has to compete for on a 5 GB VM, and memory pressure is what
+# makes the first boot slow (Rails gets pushed into swap).
+#
+# What is left running: gitaly (the Git storage), webservice (Rails + Workhorse),
+# the migrations job, PostgreSQL and Redis. That is the minimum.
+
 global:
   edition: ce
+
   hosts:
     domain: mjeannin.com
     https: false
-    ssh: false
-  global:
-  hosts:
-    domain: mjeannin.com
-    https: false
+
+  # No Ingress at all. The UI is reached through the systemd port-forward on
+  # :8181 and Argo CD reaches the repo over cluster DNS, so nothing ever enters
+  # through an Ingress — which is also why the cluster runs without Traefik.
   ingress:
+    enabled: false
     configureCertmanager: false
     tls:
       enabled: false
 
+  # --- components we never touch --------------------------------------------
+  minio:
+    enabled: false      # object storage
+  kas:
+    enabled: false      # agent server for the Kubernetes integration
+  pages:
+    enabled: false
+  praefect:
+    enabled: false      # gitaly clustering
+
+  # Disabling MinIO means every object-storage-backed feature has to go too, or
+  # the chart refuses to render ("the `connection` property can not be empty").
+  # None of them matter for hosting a repo: they are CI artifacts, LFS objects,
+  # user uploads and the package registry.
+  appConfig:
+    lfs:
+      enabled: false
+    artifacts:
+      enabled: false
+    uploads:
+      enabled: false
+    packages:
+      enabled: false
+
+# --- subcharts ---------------------------------------------------------------
+installCertmanager: false
 certmanager:
   install: false
-  psql:
-    connectTimeout: 30
-  kas:
-    enabled: false
-
-installCertmanager: false
 
 nginx-ingress:
   enabled: false
-
 prometheus:
   install: false
-
 gitlab-runner:
-  install: false
-
+  install: false        # no CI: Argo CD is what reacts to a push
 registry:
-  enabled: false
-
-gitlab-pages:
-  enabled: false
+  enabled: false        # container registry
+gitlab-zoekt:
+  install: false        # code search indexer
+upgradeCheck:
+  enabled: false        # one-shot pod that compares chart versions
 
 gitlab:
-    gitlab-exporter:
-      enabled: false
-    gitaly:
-        resources:
-            requests:
-                memory: 256Mi
-                cpu: 50m
-            limits:
-                memory: 512Mi
-    gitlab-shell:
-        enabled: false
-    webservice:
-        replicaCount: 1
-        workerProcesses: 1
-        minReplicas: 1
-        maxReplicas: 1
-        resources:
-            requests:
-                memory: 900Mi
-                cpu: 100m
-            limits:
-                memory: 1.5Gi
-    sidekiq:
-        concurrency: 5
-        replicas: 1
-        resources:
-            requests:
-                memory: 256Mi
-                cpu: 100m
-    toolbox:
-        resources:
-            requests:
-                memory: 256Mi
-                cpu: 50m
+  gitlab-shell:
+    enabled: false      # SSH access; we only ever use git over HTTP
+  gitlab-pages:
+    enabled: false
+  gitlab-exporter:
+    enabled: false      # Prometheus metrics, and Prometheus is off
+  mailroom:
+    enabled: false      # incoming email
 
+  # Backup / rails-console helper pod. The bootstrap drives GitLab through the
+  # REST API, never through the toolbox, and its image is one of the largest in
+  # the chart.
+  toolbox:
+    enabled: false
+
+  # Background job runner. Nothing we do needs it: creating the project and
+  # writing the repository both happen synchronously through Rails and Gitaly,
+  # and Argo CD clones from Gitaly. Turning it off frees close to a gigabyte,
+  # which is the single biggest win here.
+  #
+  # The bootstrap verifies right after the first push that the repo really is
+  # readable through the API. If that check ever fails, flip this back to true
+  # and re-run `vagrant provision`.
+  sidekiq:
+    enabled: false
+
+  migrations:
+    resources:
+      requests: {memory: 512Mi, cpu: 200m}
+
+  gitaly:
+    resources:
+      requests: {memory: 200Mi, cpu: 50m}
+      limits: {memory: 512Mi}
+
+  webservice:
+    replicaCount: 1
+    minReplicas: 1
+    maxReplicas: 1
+    workerProcesses: 1
+    # Everything above freed ~1.5 GB, so give it back to Rails. A tight limit
+    # is a false economy: an OOMKill here costs a two-minute restart.
+    resources:
+      requests: {memory: 1Gi, cpu: 200m}
+      limits: {memory: 2Gi}
+    workhorse:
+      resources:
+        requests: {memory: 64Mi, cpu: 20m}
+
+# --- datastores --------------------------------------------------------------
+# NB: these are the Bitnami subcharts. Their knobs live under `primary` /
+# `master` — a `resources:` block at this level is silently ignored.
 postgresql:
   install: true
-  resources:
-    requests: {cpu: 100m, memory: 256Mi}
-  persistence:
-    size: 2Gi
+  metrics:
+    enabled: false      # a postgres-exporter sidecar, on by default
+  primary:
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+    persistence:
+      size: 2Gi
 
 redis:
+  install: true
   metrics:
     enabled: false
-  install: true
-  resources:
-    requests: {cpu: 50m, memory: 64Mi}
   master:
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
     persistence:
       size: 1Gi

@@ -113,9 +113,41 @@ gitlab:
     resources:
       requests: {memory: 1Gi, cpu: 200m}
       limits: {memory: 2Gi}
+
+    # The chart's stock liveness probe is tuned for a real cluster. Its budget
+    # is initialDelay(20) + 3 x (period 60 + timeout 30) = 230s, and on this VM
+    # a cold Rails boot does not fit in it: the container was being killed
+    # mid-startup and paying for a second boot (`RESTARTS 1` in the
+    # provisioning log, ~60s off the critical path).
+    #
+    # A startupProbe is the right gate rather than a looser liveness probe:
+    # Kubernetes suspends BOTH liveness and readiness until it passes, so Rails
+    # gets 6 minutes to come up, and the moment it answers, the stock (tight)
+    # liveness probe takes over completely unchanged. Nothing about steady-state
+    # behaviour changes; only the first boot stops being interrupted.
+    #
+    # The chart renders this block verbatim (`toYaml`), so it has to carry its
+    # own httpGet. Path and port mirror the liveness probe the chart generates.
+    deployment:
+      startupProbe:
+        httpGet:
+          path: /-/liveness
+          port: 8080
+        periodSeconds: 5
+        failureThreshold: 72
+
     workhorse:
       resources:
         requests: {memory: 64Mi, cpu: 20m}
+      # Same reasoning, same 230s stock budget. Workhorse normally boots in
+      # seconds, so this probe passes on its first try and changes nothing --
+      # it is here so that a slow boot under memory pressure cannot kill this
+      # container either.
+      startupProbe:
+        exec:
+          command: ["/scripts/healthcheck"]
+        periodSeconds: 5
+        failureThreshold: 72
 
 # --- datastores --------------------------------------------------------------
 # NB: these are the Bitnami subcharts. Their knobs live under `primary` /

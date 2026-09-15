@@ -91,7 +91,7 @@ retry() {
 phase "Waiting for network"
 progress "Waiting for charts.gitlab.io to be reachable" bash -c '
   until curl -fsSL -o /dev/null https://charts.gitlab.io/; do
-    sleep 5
+    sleep 1
   done
 '
 
@@ -111,54 +111,75 @@ free -h
 # ---------------------------------------------------------------------------
 # 3. Tooling
 #
-# Five independent downloads. git and Docker both go through apt, so they share
-# one branch (dpkg takes an exclusive lock); kubectl, k3d and Helm are plain
-# binary fetches and run alongside them. The phase costs its slowest branch
-# instead of the sum of all five.
+# Four independent downloads, run in parallel: the phase costs its slowest
+# branch instead of the sum of all four.
+#
+# git is deliberately NOT here any more. Nothing needs it until step 12 pushes
+# the manifests, minutes from now, so it rides along with the background
+# downloads of step 6 instead of sitting on the critical path in front of the
+# cluster.
 # ---------------------------------------------------------------------------
 phase "Installing tooling"
 
-progress "Installing git, Docker, kubectl, k3d and Helm (in parallel)" bash -c '
-  set -eu
-  pids=""
+# get.docker.com also installs docker-buildx-plugin and docker-compose-plugin,
+# ~120 MB that nothing in this project ever invokes. Going straight to Docker's
+# apt repo lets us skip them. Every step is &&-chained so the function returns
+# the first failure rather than blundering on.
+install_docker_apt() {
+  install -m 0755 -d /etc/apt/keyrings &&
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc &&
+  chmod a+r /etc/apt/keyrings/docker.asc &&
+  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+    "$(dpkg --print-architecture)" \
+    "$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    > /etc/apt/sources.list.d/docker.list &&
+  apt-get update -qq &&
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io
+}
 
-  # One branch for everything apt-based: dpkg would refuse to run these at the
-  # same time anyway.
-  (
-    command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq git; }
-    command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh
-  ) &
-  pids="$pids $!"
+# If anything about that differs from what we expect, fall back to the official
+# convenience script — i.e. to exactly the behaviour this script had before.
+# The half-written repo file is removed first, or the fallback's own
+# `apt-get update` would trip over it.
+install_docker() {
+  install_docker_apt && return 0
+  echo "  apt route failed, falling back to get.docker.com"
+  rm -f /etc/apt/sources.list.d/docker.list
+  curl -fsSL https://get.docker.com | sh
+}
 
-  if ! command -v kubectl >/dev/null 2>&1; then
-    (
-      v=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-      curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${v}/bin/linux/amd64/kubectl"
-      install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-      rm -f /tmp/kubectl
-    ) &
-    pids="$pids $!"
-  fi
+install_kubectl() {
+  local v
+  v=$(curl -fsSL https://dl.k8s.io/release/stable.txt) &&
+  curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${v}/bin/linux/amd64/kubectl" &&
+  install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl &&
+  rm -f /tmp/kubectl
+}
 
-  if ! command -v k3d >/dev/null 2>&1; then
-    ( curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash ) &
-    pids="$pids $!"
-  fi
+install_k3d() {
+  curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+}
 
-  if ! command -v helm >/dev/null 2>&1; then
-    (
-      curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-      chmod 700 /tmp/get_helm.sh
-      /tmp/get_helm.sh
-      rm -f /tmp/get_helm.sh
-    ) &
-    pids="$pids $!"
-  fi
+install_helm() {
+  curl -fsSL -o /tmp/get_helm.sh \
+    https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 &&
+  chmod 700 /tmp/get_helm.sh &&
+  /tmp/get_helm.sh &&
+  rm -f /tmp/get_helm.sh
+}
 
-  rc=0
-  for pid in $pids; do wait "$pid" || rc=1; done
-  exit $rc
-'
+install_tooling() {
+  local pids="" pid rc=0
+  command -v docker  >/dev/null 2>&1 || { install_docker  & pids="${pids} $!"; }
+  command -v kubectl >/dev/null 2>&1 || { install_kubectl & pids="${pids} $!"; }
+  command -v k3d     >/dev/null 2>&1 || { install_k3d     & pids="${pids} $!"; }
+  command -v helm    >/dev/null 2>&1 || { install_helm    & pids="${pids} $!"; }
+  for pid in ${pids}; do wait "${pid}" || rc=1; done
+  return ${rc}
+}
+
+progress "Installing Docker, kubectl, k3d and Helm (in parallel)" install_tooling
 usermod -aG docker vagrant
 
 docker --version
@@ -167,12 +188,23 @@ k3d version
 helm version --short
 
 # ---------------------------------------------------------------------------
-# 4. Helm repositories
+# 4. Helm repositories — started here, collected at the end of step 5
+#
+# Adding a repo is a metadata fetch over the network; creating the k3d cluster
+# is local Docker work. Neither needs the other, and nothing needs the repos
+# until step 8, so they download while the cluster boots and the phase costs
+# nothing on the critical path.
 # ---------------------------------------------------------------------------
-phase "Adding Helm repositories"
-progress "Adding gitlab repo" retry 5 helm repo add gitlab https://charts.gitlab.io/
-progress "Adding argo repo" retry 5 helm repo add argo https://argoproj.github.io/argo-helm
-progress "Updating repos" helm repo update
+phase "Adding Helm repositories (in the background)"
+
+add_helm_repos() {
+  retry 5 helm repo add gitlab https://charts.gitlab.io/ &&
+  retry 5 helm repo add argo https://argoproj.github.io/argo-helm &&
+  helm repo update
+}
+add_helm_repos &> /tmp/helm-repos.log &
+HELM_REPOS_PID=$!
+echo "  running in the background (pid ${HELM_REPOS_PID}, log /tmp/helm-repos.log)"
 
 # ---------------------------------------------------------------------------
 # 5. k3d cluster
@@ -194,6 +226,15 @@ mkdir -p /home/vagrant/.kube
 cp /root/.kube/config /home/vagrant/.kube/config
 chown -R vagrant:vagrant /home/vagrant/.kube
 
+# Collect step 4 before step 8 needs the charts.
+if wait "${HELM_REPOS_PID}"; then
+  echo "  Helm repositories ready"
+else
+  echo "  Helm repositories FAILED — output follows"
+  sed 's/^/  /' /tmp/helm-repos.log
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # 6. Pre-import application images — started here, collected in step 10
 #
@@ -205,11 +246,18 @@ chown -R vagrant:vagrant /home/vagrant/.kube
 #
 # Nothing needs these images until Argo CD syncs, several minutes from now, so
 # the download runs in the background and overlaps GitLab's startup instead of
-# sitting in front of it. The Argo CD CLI rides along: it is a convenience for
-# the defense, not something this script uses.
+# sitting in front of it. Two things ride along: git, which step 12 needs and
+# nothing before it does, and the Argo CD CLI, a convenience for the defense
+# that this script never calls.
 # ---------------------------------------------------------------------------
 phase "Starting background downloads"
 (
+  # git is not needed until step 12 pushes the manifests. apt is free now that
+  # step 3 is done, so installing it here keeps it off the critical path.
+  if ! command -v git >/dev/null 2>&1; then
+    apt-get update -qq && apt-get install -y -qq git
+  fi
+
   for tag in v1 v2; do
     retry 3 docker pull "${APP_IMAGE_REPO}:${tag}"
   done
@@ -267,7 +315,7 @@ progress "Installing ArgoCD via Helm (up to 10 min)" retry 3 helm upgrade --inst
 # ---------------------------------------------------------------------------
 phase "Collecting background downloads"
 if wait "${DOWNLOADS_PID}"; then
-  echo "  application images imported, argocd CLI installed"
+  echo "  git installed, application images imported, argocd CLI installed"
 else
   echo "  FAILED — output follows"
   sed 's/^/  /' /tmp/background-downloads.log

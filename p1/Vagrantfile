@@ -7,7 +7,7 @@ VM_CPUS     = 2
 SERVER_IP   = "192.168.56.110"
 WORKER_IP   = "192.168.56.111"
 
-BOX_IMAGE   = "debian/bookworm64"
+BOX_IMAGE   = "bento/debian-13"
 
 Vagrant.configure("2") do |config|
 #  config.vm.synced_folder "/home/#{LOGIN}/sgoinfre/iot", "/vagrant", type: "rsync"

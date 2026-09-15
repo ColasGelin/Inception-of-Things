@@ -5,7 +5,7 @@ VM_MEMORY = 4048
 VM_CPUS   = 4
 
 SERVER_IP = "192.168.56.110"
-BOX_IMAGE = "debian/bookworm64"
+BOX_IMAGE = "bento/debian-13"
 
 Vagrant.configure("2") do |config|
 

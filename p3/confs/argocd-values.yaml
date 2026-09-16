@@ -55,6 +55,6 @@ configs:
     # svc/argocd-server and the browser needs no certificate exception.
     server.insecure: true
   cm:
-    # Default is 180s. One minute makes the "push to GitLab -> new pod" demo
+    # Default is 180s. One minute makes the "push to GitHub -> new pod" demo
     # short enough to watch.
     timeout.reconciliation: 60s

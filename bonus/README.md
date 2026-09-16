@@ -5,7 +5,7 @@ Part 3, but **fully self-hosted**: the Git repository Argo CD watches no longer 
 ## Architecture
 
 ```
-VM 192.168.56.120 (Debian 13 (Trixie), 5 CPUs, 5 GB RAM + 4 GB swap)
+VM 192.168.56.120 (Ubuntu 22.04, 5 CPUs, 5 GB RAM + 4 GB swap)
 └─ Docker
    └─ k3d cluster "p3-cluster"
       │
@@ -37,7 +37,7 @@ The key point: **Argo CD reaches GitLab through the cluster's internal DNS** (`<
 
 | File | Purpose |
 |---|---|
-| `Vagrantfile` | One Debian 13 (Trixie) VM, IP `192.168.56.120`, 5 CPUs / 5 GB RAM, `confs/` rsynced to `/vagrant/confs` |
+| `Vagrantfile` | One Ubuntu 22.04 VM, IP `192.168.56.120`, 5 CPUs / 5 GB RAM, `confs/` rsynced to `/vagrant/confs` |
 | `scripts/bootstrap.sh` | Provisions everything: tooling, cluster, Argo CD, GitLab, project, token, repo registration |
 | `confs/argocd-values.yaml` | Helm values for Argo CD: small resource requests, unused components disabled, 60s sync interval |
 | `confs/gitlab-values.yaml` | Helm values for GitLab: every component that isn't needed to serve one repo over HTTP, switched off |
@@ -123,7 +123,8 @@ The webservice is then *given back* some of what the others freed — `requests:
 ### 9. Argo CD (Helm) — while GitLab boots
 `argocd-values.yaml`:
 - lowers the resource requests so the scheduler can fit everything
-- disables `applicationSet`, `notifications` and `dex` (SSO), none of which are used here
+- disables `notifications` and `dex` (SSO), and runs the ApplicationSet controller at `replicas: 0` (chart 10.x dropped `applicationSet.enabled`), none of which are used here
+- raises the `server` and `repoServer` probe budget to `timeoutSeconds: 5` / `failureThreshold: 6`: the chart allows 1 second per health check, and on a VM that is simultaneously booting GitLab, `argocd-repo-server` misses three in a row and gets killed
 - sets `server.insecure: true` so the UI is served over plain HTTP
 - sets `timeout.reconciliation: 60s` so Argo CD checks Git every minute instead of every 3
 

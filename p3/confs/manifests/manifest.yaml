@@ -1,0 +1,27 @@
+# Reference copy of manifests/manifest.yaml in
+# https://github.com/Maj-e/Inception-of-Things-CI
+#
+# Argo CD reads the copy on GitHub, never this one. It lives here so the
+# repository under review shows what is being deployed -- and so the image tag
+# that is swapped during the demo (v1 <-> v2) is visible without leaving the
+# project.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wil-playground
+  namespace: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wil-playground
+  template:
+    metadata:
+      labels:
+        app: wil-playground
+    spec:
+      containers:
+      - name: playground
+        image: wil42/playground:v1
+        ports:
+        - containerPort: 8888

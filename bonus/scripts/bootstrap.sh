@@ -4,25 +4,21 @@ set -euo pipefail
 CLUSTER_NAME="p3-cluster"
 GITLAB_CHART_VERSION="9.9.2"
 
-# --- GitOps / GitLab settings ----------------------------------------------
+# --- GitOps / GitLab settings ---
+# 8181 is Workhorse: Rails on 8080 serves the API but rejects git-over-HTTP, so
+# 8181 is the only port that works for both. Both ports are opened by step 11.
 GITLAB_PROJECT_PATH="playground"
-# These two ports are opened permanently by the systemd units of step 11, on
-# 0.0.0.0, so the same address works inside the VM and from the host.
 VM_IP="192.168.56.120"
 GITLAB_LOCAL_PORT=8181
 ARGOCD_LOCAL_PORT=8080
 GITLAB_LOCAL_URL="http://localhost:${GITLAB_LOCAL_PORT}"
-# Port 8181 = Workhorse. Rails on 8080 serves the API but REJECTS git-over-HTTP
-# ("Nil JSON web token"), so 8181 is the only port that works for both.
 GITLAB_INTERNAL_HOST="gitlab-webservice-default.gitlab.svc.cluster.local:8181"
 GITLAB_INTERNAL_REPO="http://${GITLAB_INTERNAL_HOST}/root/${GITLAB_PROJECT_PATH}.git"
 APP_IMAGE_REPO="wil42/playground"
 WORK_CLONE="/home/vagrant/${GITLAB_PROJECT_PATH}"
 
-# ---------------------------------------------------------------------------
-# Helper: print a timestamped phase marker (permanent, multi-line, never
-# overwritten)
-# ---------------------------------------------------------------------------
+# --- phase ---
+# Print a permanent, timestamped marker between sections.
 phase() {
   echo ""
   echo "============================================================"
@@ -30,11 +26,8 @@ phase() {
   echo "============================================================"
 }
 
-# ---------------------------------------------------------------------------
-# Helper: run a long command with a single-line spinner. On success the
-# spinner line is replaced by a one-line "OK"; on failure it's replaced by
-# a "FAILED" line followed by the captured output, so nothing is lost.
-# ---------------------------------------------------------------------------
+# --- progress ---
+# Run a long command behind a spinner, printing its output only on failure.
 progress() {
   local msg="$1"; shift
   local logfile
@@ -68,11 +61,8 @@ progress() {
   return $status
 }
 
-# ---------------------------------------------------------------------------
-# Helper: retry a command a few times before giving up for real.
-# helm upgrade --install is idempotent, so re-running after a transient
-# failure (flaky DNS mid-pull, etc.) resumes instead of restarting.
-# ---------------------------------------------------------------------------
+# --- retry ---
+# Re-run a command a few times; helm upgrade --install is idempotent, so it resumes.
 retry() {
   local attempts="$1"; shift
   local i=1
@@ -85,9 +75,8 @@ retry() {
   done
 }
 
-# ---------------------------------------------------------------------------
-# 1. Wait for network
-# ---------------------------------------------------------------------------
+# --- 1. Wait for network ---
+# Provisioning starts before DNS is necessarily up, so block until the chart repo answers.
 phase "Waiting for network"
 progress "Waiting for charts.gitlab.io to be reachable" bash -c '
   until curl -fsSL -o /dev/null https://charts.gitlab.io/; do
@@ -95,9 +84,8 @@ progress "Waiting for charts.gitlab.io to be reachable" bash -c '
   done
 '
 
-# ---------------------------------------------------------------------------
-# 2. Swapfile  (must come before anything memory-hungry)
-# ---------------------------------------------------------------------------
+# --- 2. Swap ---
+# GitLab is memory-hungry; without swap the OOM killer takes its pods during startup.
 phase "Setting up swap"
 if [ ! -f /swapfile ]; then
   fallocate -l 4G /swapfile
@@ -108,23 +96,10 @@ if [ ! -f /swapfile ]; then
 fi
 free -h
 
-# ---------------------------------------------------------------------------
-# 3. Tooling
-#
-# Four independent downloads, run in parallel: the phase costs its slowest
-# branch instead of the sum of all four.
-#
-# git is deliberately NOT here any more. Nothing needs it until step 12 pushes
-# the manifests, minutes from now, so it rides along with the background
-# downloads of step 6 instead of sitting on the critical path in front of the
-# cluster.
-# ---------------------------------------------------------------------------
+# --- 3. Tooling ---
+# Install Docker, kubectl, k3d and Helm in parallel, each only if missing.
 phase "Installing tooling"
 
-# get.docker.com also installs docker-buildx-plugin and docker-compose-plugin,
-# ~120 MB that nothing in this project ever invokes. Going straight to Docker's
-# apt repo lets us skip them. Every step is &&-chained so the function returns
-# the first failure rather than blundering on.
 install_docker_apt() {
   install -m 0755 -d /etc/apt/keyrings &&
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
@@ -138,10 +113,6 @@ install_docker_apt() {
   apt-get install -y -qq docker-ce docker-ce-cli containerd.io
 }
 
-# If anything about that differs from what we expect, fall back to the official
-# convenience script — i.e. to exactly the behaviour this script had before.
-# The half-written repo file is removed first, or the fallback's own
-# `apt-get update` would trip over it.
 install_docker() {
   install_docker_apt && return 0
   echo "  apt route failed, falling back to get.docker.com"
@@ -187,14 +158,8 @@ kubectl version --client
 k3d version
 helm version --short
 
-# ---------------------------------------------------------------------------
-# 4. Helm repositories — started here, collected at the end of step 5
-#
-# Adding a repo is a metadata fetch over the network; creating the k3d cluster
-# is local Docker work. Neither needs the other, and nothing needs the repos
-# until step 8, so they download while the cluster boots and the phase costs
-# nothing on the critical path.
-# ---------------------------------------------------------------------------
+# --- 4. Helm repositories ---
+# Fetch the gitlab and argo chart indexes in the background while the cluster boots.
 phase "Adding Helm repositories (in the background)"
 
 add_helm_repos() {
@@ -206,13 +171,8 @@ add_helm_repos &> /tmp/helm-repos.log &
 HELM_REPOS_PID=$!
 echo "  running in the background (pid ${HELM_REPOS_PID}, log /tmp/helm-repos.log)"
 
-# ---------------------------------------------------------------------------
-# 5. k3d cluster
-# ---------------------------------------------------------------------------
-# GitLab no longer publishes an Ingress (see confs/gitlab-values.yaml) and the
-# playground Service is a LoadBalancer served by k3s's own servicelb, so
-# Traefik has nothing left to route: disabling it drops a Helm-install job, a
-# pod and an image pull from the critical path. Port 80 goes with it.
+# --- 5. k3d cluster ---
+# Create the cluster with 8888 published; Traefik and metrics-server are unused here.
 phase "Creating k3d cluster"
 if ! k3d cluster list | grep -q "${CLUSTER_NAME}"; then
   progress "Creating k3d cluster ${CLUSTER_NAME}" k3d cluster create "${CLUSTER_NAME}" \
@@ -226,7 +186,6 @@ mkdir -p /home/vagrant/.kube
 cp /root/.kube/config /home/vagrant/.kube/config
 chown -R vagrant:vagrant /home/vagrant/.kube
 
-# Collect step 4 before step 8 needs the charts.
 if wait "${HELM_REPOS_PID}"; then
   echo "  Helm repositories ready"
 else
@@ -235,25 +194,10 @@ else
   exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# 6. Pre-import application images — started here, collected in step 10
-#
-# Pull on the HOST and side-load into the k3d nodes so the kubelet never has to
-# reach Docker Hub. With GitLab running this VM is memory-starved, CoreDNS gets
-# flaky, and in-cluster image pulls fail with "lookup registry-1.docker.io:
-# Try again". Importing both tags up front makes the v1 -> v2 demo immune to
-# that (and to Docker Hub rate limits).
-#
-# Nothing needs these images until Argo CD syncs, several minutes from now, so
-# the download runs in the background and overlaps GitLab's startup instead of
-# sitting in front of it. Two things ride along: git, which step 12 needs and
-# nothing before it does, and the Argo CD CLI, a convenience for the defense
-# that this script never calls.
-# ---------------------------------------------------------------------------
+# --- 6. Background downloads ---
+# Side-load both playground tags, plus git and the argocd CLI, while GitLab boots.
 phase "Starting background downloads"
 (
-  # git is not needed until step 12 pushes the manifests. apt is free now that
-  # step 3 is done, so installing it here keeps it off the critical path.
   if ! command -v git >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq git
   fi
@@ -272,27 +216,16 @@ phase "Starting background downloads"
 DOWNLOADS_PID=$!
 echo "  running in the background (pid ${DOWNLOADS_PID}, log /tmp/background-downloads.log)"
 
-# ---------------------------------------------------------------------------
-# 7. Namespaces
-# ---------------------------------------------------------------------------
+# --- 7. Namespaces ---
+# Create gitlab, argocd and dev, idempotently.
 phase "Creating namespaces"
 for ns in gitlab argocd dev; do
   kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f -
 done
 
-# ---------------------------------------------------------------------------
-# 8. GitLab FIRST, and deliberately without --wait
-#
-# GitLab is the long pole: database migrations plus a Rails boot that nothing
-# can shorten. `helm upgrade --install` without `--wait` returns as soon as the
-# objects exist, so the cluster starts pulling images and migrating while this
-# script goes on to install Argo CD and collect the background downloads.
-# Waiting on the whole release would have serialised all of that behind it.
-#
-# The readiness gate has not disappeared, it has moved to step 12, where we
-# poll the GitLab API — which is the thing we actually depend on, and a far
-# tighter condition than "every pod in the release is ready".
-# ---------------------------------------------------------------------------
+# --- 8. GitLab ---
+# Apply the chart without --wait so Rails boots while the script installs Argo CD;
+# the readiness gate is in step 12, on the API we actually depend on.
 phase "Installing GitLab (starts booting in the background)"
 progress "Applying GitLab chart" retry 3 helm upgrade --install gitlab gitlab/gitlab \
   --namespace gitlab \
@@ -300,9 +233,8 @@ progress "Applying GitLab chart" retry 3 helm upgrade --install gitlab gitlab/gi
   --values /vagrant/confs/gitlab-values.yaml \
   --timeout 1200s
 
-# ---------------------------------------------------------------------------
-# 9. ArgoCD — installed while GitLab boots
-# ---------------------------------------------------------------------------
+# --- 9. Argo CD ---
+# Install the chart with our values while GitLab is still starting.
 phase "Installing ArgoCD"
 progress "Installing ArgoCD via Helm (up to 10 min)" retry 3 helm upgrade --install argocd argo/argo-cd \
   --namespace argocd \
@@ -310,9 +242,8 @@ progress "Installing ArgoCD via Helm (up to 10 min)" retry 3 helm upgrade --inst
   --wait \
   --timeout 600s
 
-# ---------------------------------------------------------------------------
-# 10. Collect the background downloads from step 6
-# ---------------------------------------------------------------------------
+# --- 10. Collect the background downloads ---
+# Turn a failed download into a clear error here rather than an ImagePullBackOff later.
 phase "Collecting background downloads"
 if wait "${DOWNLOADS_PID}"; then
   echo "  git installed, application images imported, argocd CLI installed"
@@ -322,22 +253,8 @@ else
   exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# 11. Permanent port forwarding (systemd)
-#
-# The VM is not on the pod network, so it cannot resolve *.svc.cluster.local:
-# a kubectl port-forward is the only way to reach GitLab and ArgoCD from here.
-# Rather than opening one by hand for every demo, install one systemd unit per
-# UI:
-#   * enabled         -> they come back on their own when the VM reboots
-#   * Restart=always  -> a forward dies with the pod it is attached to; systemd
-#     reopens it seconds later, so a rescheduled pod is not a dead link
-#   * --address 0.0.0.0 -> reachable from the host at ${VM_IP}, not only from
-#     inside the VM, which is what removes the need for a helper CLI
-#
-# ArgoCD itself IS in the cluster and still reaches GitLab over internal DNS
-# (see step 13); these tunnels exist only for humans.
-# ---------------------------------------------------------------------------
+# --- 11. Port forwarding ---
+# The VM is not on the pod network, so expose both UIs through systemd port-forwards.
 phase "Installing permanent port-forward services"
 
 install_port_forward() {
@@ -361,8 +278,6 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-  # Reload before enabling: on a re-provision the file we just overwrote is
-  # already loaded, and systemd would otherwise keep serving the old one.
   systemctl daemon-reload
   systemctl enable "${unit}.service" &> /dev/null
   systemctl restart "${unit}.service"
@@ -377,20 +292,13 @@ systemctl is-active gitlab-forward.service argocd-forward.service || true
 echo "  GitLab UI : http://${VM_IP}:${GITLAB_LOCAL_PORT}"
 echo "  ArgoCD UI : http://${VM_IP}:${ARGOCD_LOCAL_PORT}"
 
-# ---------------------------------------------------------------------------
-# 12. GitLab project: token, project creation, manifest push
-#
-# This is where we finally block on GitLab, through the forward installed just
-# above — which is also why the working clone can push without any extra
-# terminal.
-# ---------------------------------------------------------------------------
+# --- 12. GitLab project ---
+# Wait for the API, mint a token, create the project and push the manifests through the forward.
 phase "Setting up GitLab project"
 
 GITLAB_ROOT_PASSWORD=$(kubectl get secret gitlab-gitlab-initial-root-password \
   -n gitlab -o jsonpath='{.data.password}' | base64 -d)
 
-# Rails answers 401 on /api/v4/version once it is booted; a connection error or
-# 502 means it is still starting. 401 is therefore our readiness signal.
 progress "Waiting for GitLab API through the forward" bash -c "
   until [ \"\$(curl -s -o /dev/null -w '%{http_code}' '${GITLAB_LOCAL_URL}/api/v4/version' || true)\" = '401' ]; do
     sleep 5
@@ -403,9 +311,6 @@ echo "Memory/swap usage now that GitLab is up:"
 free -h
 echo ""
 
-# GitLab 18.x rejects username/password on the REST API, so authenticate via
-# the OAuth password grant first. That token is short-lived (~2h), so we
-# immediately use it to mint a long-lived PAT for ArgoCD.
 progress "Obtaining OAuth token" bash -c "
   curl -fsS -X POST '${GITLAB_LOCAL_URL}/oauth/token' \
     -d 'grant_type=password' \
@@ -416,8 +321,6 @@ progress "Obtaining OAuth token" bash -c "
 GITLAB_OAUTH=$(grep -o '"access_token":"[^"]*"' /tmp/gitlab-oauth.json | cut -d'"' -f4)
 rm -f /tmp/gitlab-oauth.json
 
-# /api/v4/users/:id/personal_access_tokens is the ADMIN endpoint. The
-# self-service /api/v4/personal_access_tokens endpoint 404s on this version.
 PAT_EXPIRY=$(date -d '+1 year' +%Y-%m-%d)
 progress "Creating personal access token" bash -c "
   curl -fsS -X POST '${GITLAB_LOCAL_URL}/api/v4/users/1/personal_access_tokens' \
@@ -436,7 +339,6 @@ if [ -z "${GITLAB_PAT}" ]; then
 fi
 echo "  token acquired: ${GITLAB_PAT:0:12}..."
 
-# Create the project only if it does not already exist (idempotent reruns)
 PROJECT_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
   -H "PRIVATE-TOKEN: ${GITLAB_PAT}" \
   "${GITLAB_LOCAL_URL}/api/v4/projects/root%2F${GITLAB_PROJECT_PATH}" || true)
@@ -452,9 +354,8 @@ else
   "
 fi
 
-# Build the repo in the vagrant user's home so it survives as a working clone
-# for the defense demo. Never git-init inside /vagrant — that folder is synced
-# back to the host and would pollute the submission repo.
+# The clone lives in the vagrant user's home, never in /vagrant, which is synced
+# back to the host.
 rm -rf "${WORK_CLONE}"
 mkdir -p "${WORK_CLONE}/manifests"
 cp /vagrant/confs/manifests/*.yaml "${WORK_CLONE}/manifests/"
@@ -472,10 +373,8 @@ progress "Pushing manifests to GitLab" bash -c "
 "
 chown -R vagrant:vagrant "${WORK_CLONE}"
 
-# Prove the push landed somewhere ArgoCD can clone from. This is the check that
-# backs the disabled Sidekiq: if skipping the post-receive background jobs ever
-# did break repository bookkeeping, it surfaces HERE, during provisioning, with
-# a fix attached — not on defense day.
+# Prove the push landed somewhere ArgoCD can clone from. This is what backs the
+# decision to run without Sidekiq: a failure surfaces here, not on defense day.
 if ! progress "Verifying the repository serves its content back" bash -c "
   [ \"\$(curl -s -o /dev/null -w '%{http_code}' \
       -H 'PRIVATE-TOKEN: ${GITLAB_PAT}' \
@@ -492,13 +391,9 @@ MSG
   exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# 13. Register the repo with ArgoCD
-#
-# The label is the whole mechanism — without it ArgoCD ignores the Secret.
-# 'url' must match spec.source.repoURL in application.yaml byte-for-byte;
-# ArgoCD pairs credentials to Applications by string comparison.
-# ---------------------------------------------------------------------------
+# --- 13. Repository credentials ---
+# Register the repo with ArgoCD; the label is what makes ArgoCD read the Secret, and
+# url must match spec.source.repoURL byte-for-byte.
 phase "Registering GitLab repo with ArgoCD"
 kubectl apply -f - <<EOF
 apiVersion: v1
@@ -515,13 +410,8 @@ stringData:
   password: ${GITLAB_PAT}
 EOF
 
-# ---------------------------------------------------------------------------
-# 14. Credentials for the defense
-#
-# No tunnel helper any more: both UIs are permanently forwarded (step 11), and
-# the working clone pushes to localhost:${GITLAB_LOCAL_PORT} through the very
-# same forward.
-# ---------------------------------------------------------------------------
+# --- 14. Credentials ---
+# Keep both UI passwords and the PAT on disk for the defense.
 phase "Writing credentials"
 
 ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
@@ -539,15 +429,18 @@ EOF
 chmod 600 /home/vagrant/gitlab-creds.txt
 chown vagrant:vagrant /home/vagrant/gitlab-creds.txt
 
-# ---------------------------------------------------------------------------
-# 15. Application manifest
-# ---------------------------------------------------------------------------
+# --- 15. Application ---
+# Declare what ArgoCD deploys, once the repo-server that renders it is up, then
+# clear any comparison that failed while it was starting.
 phase "Applying ArgoCD Application"
+progress "Waiting for the repo-server" \
+  kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=300s
 kubectl apply -f /vagrant/confs/application.yaml
+kubectl -n argocd annotate app playground \
+  argocd.argoproj.io/refresh=hard --overwrite &> /dev/null || true
 
-# ---------------------------------------------------------------------------
-# 16. Summary
-# ---------------------------------------------------------------------------
+# --- 16. Summary ---
+# Print the cluster state, both URLs and their passwords.
 phase "Done"
 
 echo ""

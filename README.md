@@ -94,7 +94,9 @@ The manifests are dropped into K3s's auto-deploy directory, so the apps come up 
 
 ### Part 3: K3d and Argo CD
 
-One Debian VM (`192.168.56.120`) running Docker and a K3d cluster. Argo CD is installed in the `argocd` namespace and watches a **public GitHub repository**. It deploys whatever it finds there into the `dev` namespace. To deploy `wil42/playground:v2` instead of `v1`, you change the image tag in GitHub and push. No `kubectl` needed.
+One VM (`192.168.56.120`) running Docker and a K3d cluster. Argo CD is installed with Helm in the `argocd` namespace and watches a **public GitHub repository**, deploying whatever it finds there into the `dev` namespace. To deploy `wil42/playground:v2` instead of `v1`, you change the image tag in GitHub and push. No `kubectl` needed.
+
+The bootstrap is built like the bonus one: numbered phases, parallel tooling install, both app images pre-imported into the cluster, and a systemd unit that keeps the Argo CD UI forwarded to `192.168.56.120:8080` across reboots.
 
 ### Bonus: GitLab
 
@@ -108,7 +110,7 @@ Same idea as Part 3, but the Git server is also self-hosted: **GitLab CE is inst
 | Kubernetes | K3s | K3s | K3d (K3s in Docker) | K3d |
 | Nodes | server + agent | server | server (container) | server (container) |
 | How things get deployed | nothing deployed | K3s auto-deploy manifests | Argo CD ← GitHub | Argo CD ← GitLab (in-cluster) |
-| Exposed on | `:6443` (API) | `:80` (Ingress) | `:8888` | `:8888` (app), `:80` (GitLab Ingress) |
+| Exposed on | `:6443` (API) | `:80` (Ingress) | `:8888` (app), `:8080` (Argo CD) | `:8888` (app), `:8080` (Argo CD), `:8181` (GitLab) |
 
 ---
 

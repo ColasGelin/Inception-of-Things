@@ -1,22 +1,37 @@
-
   LOGIN = "mjeannin"
 
   PROVIDER    = "virtualbox"
-  VM_MEMORY   = 8192
-  VM_CPUS     = 6
+  VM_MEMORY   = 4096
+  VM_CPUS     = 4
 
   SERVER_IP = "192.168.56.120"
 
   Vagrant.configure("2") do |config|
-    config.vm.box = "generic/ubuntu2204" 
+    config.vm.box = "generic/ubuntu2204"
     config.vm.hostname = "#{LOGIN}S"
 
-    config.vm.synced_folder ".", "/vagrant", type: "rsync"
+    # Skip the generate-keypair / insert / disconnect / reconnect dance Vagrant
+    # runs during boot. The VM keeps Vagrant's well-known key, which is fine for
+    # a local throwaway cluster, and saves a full reconnect cycle every boot.
+    config.ssh.insert_key = false
+
+    # Only the two folders the bootstrap actually reads. Syncing the whole
+    # project folder would also push .vagrant/ and the READMEs into the VM for
+    # nothing.
+    config.vm.synced_folder "./confs",   "/vagrant/confs",   type: "rsync"
+    config.vm.synced_folder "./scripts", "/vagrant/scripts", type: "rsync"
 
     config.vm.provider PROVIDER do |lv|
       lv.cpus = "#{VM_CPUS}"
       lv.memory = "#{VM_MEMORY}"
       lv.name = "#{LOGIN}_VM"
+
+      # Resolve DNS through the host's resolver instead of VirtualBox's own NAT
+      # DNS proxy. The proxy is what makes in-VM lookups flaky, and CoreDNS
+      # forwards to it -- which is the "lookup quay.io: Try again" /
+      # "lookup registry-1.docker.io: Try again" failure that leaves the ArgoCD
+      # pods stuck in ImagePullBackOff.
+      lv.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
     end
 
     config.vm.network "private_network", ip: "#{SERVER_IP}"

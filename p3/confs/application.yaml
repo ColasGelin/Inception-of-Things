@@ -6,7 +6,11 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/Maj-e/Inception-of-Things-CI
+    # Public GitHub repository holding the manifests. This string is compared
+    # byte-for-byte against the `url` of any repository Secret in the argocd
+    # namespace, so if you ever make the repo private (see the github-token
+    # note in scripts/bootstrap.sh) both have to stay identical.
+    repoURL: https://github.com/Maj-e/Inception-of-Things-CI.git
     targetRevision: main
     path: manifests
   destination:
@@ -14,5 +18,7 @@ spec:
     namespace: dev
   syncPolicy:
     automated:
-      prune: true
-      selfHeal: true
+      prune: true      # delete what was removed from Git
+      selfHeal: true   # undo changes made directly in the cluster
+    syncOptions:
+      - CreateNamespace=true

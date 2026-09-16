@@ -2,6 +2,7 @@
 
 Two virtual machines, built by Vagrant, that together form a **two-node Kubernetes cluster** using K3s:
 
+
 - one **server** node (control plane)
 - one **agent** node (worker)
 

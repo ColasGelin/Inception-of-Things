@@ -1,12 +1,18 @@
+# Reference copy of manifests/service.yaml in
+# https://github.com/Maj-e/Inception-of-Things-CI
+#
+# LoadBalancer is served by k3s's own servicelb; the k3d load balancer
+# container publishes it on the VM as port 8888 (see the -p flag in
+# scripts/bootstrap.sh).
 apiVersion: v1
 kind: Service
 metadata:
-  name: playground
+  name: wil-playground
   namespace: dev
 spec:
-  type: LoadBalancer
   selector:
-    app: playground
+    app: wil-playground
   ports:
-    - port: 8888
-      targetPort: 8888
+  - port: 8888
+    targetPort: 8888
+  type: LoadBalancer

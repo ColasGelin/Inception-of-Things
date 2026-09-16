@@ -2,3 +2,4 @@ en.subject.pdf
 .vagrant/
 *.box
 node-token
+p3/confs/github-token
